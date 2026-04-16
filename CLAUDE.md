@@ -4,13 +4,14 @@ A Codex/Claude Code-style local coding agent written in Rust, speaking ACP (Agen
 
 **Model:** `mlx-community/Qwen3-14B-4bit` on M1 Pro 16GB  
 **Binary:** `target/release/rust-agent`  
-**MLX server:** `/Users/daxel/main.py` (FastAPI, runs at `http://127.0.0.1:8000`)
+**MLX server:** `~/python-mlx-sv/main.py` (FastAPI, runs at `http://127.0.0.1:8000`)
 
 ## Quick Start
 
 ```bash
 # Start MLX server
-cd ~ && uvicorn main:app
+source ~/mlx-env/bin/activate
+cd ~/python-mlx-sv && uvicorn main:app
 
 # Build agent
 cargo build --release
@@ -37,7 +38,7 @@ src/
     command.rs       — run_command (60s timeout), command sessions (start/read/write/terminate)
     web.rs           — web_fetch, web_search (DuckDuckGo)
 
-/Users/daxel/main.py  — MLX FastAPI server (outside repo)
+~/python-mlx-sv/main.py  — MLX FastAPI server (separate repo)
 ```
 
 ## Tools (15)
@@ -51,6 +52,15 @@ src/
 
 `initialize`, `authenticate`, `session/new`, `session/load`, `session/prompt`,
 `session/set_mode`, `session/cancel`
+
+## Modes (Zed panel dropdown)
+
+| Mode | Description |
+|------|-------------|
+| Ask | Read-only — answers questions and inspects code |
+| Edit | File changes only — read, patch, create |
+| Agent | Full mode — search, web, shell, edits, validation |
+| Fast | Agent mode with thinking disabled (`/no_think`) — faster responses |
 
 ## Config
 
@@ -99,6 +109,11 @@ Zed → ACP session/prompt
   → acp.rs persists turn, sends agent_message_chunk
 ```
 
+### Fast mode / thinking toggle
+When mode is `fast`, `build_messages` in `acp.rs` prepends `/no_think` to the system message.
+`main.py` detects this and passes `enable_thinking=False` to `apply_chat_template`, skipping
+the `<think>` block entirely. Switching back to `agent` mode re-enables thinking.
+
 ### ACP terminal support (Phase 9)
 When Zed advertises `clientCapabilities.terminal = true`, `run_command_tool` routes
 through `invoke_via_terminal` instead of the local subprocess runner:
@@ -110,38 +125,26 @@ through `invoke_via_terminal` instead of the local subprocess runner:
 All three post-create calls require both `sessionId` and `terminalId` in the request.
 Falls back to local `run_command_tool` if any step fails.
 
-### Qwen3.5 tool calling quirks
+### Qwen3 tool calling quirks
 - `role: "tool"` messages must be converted to `role: "user"` with `<tool_response>` wrapper before reaching the Jinja2 template (`message_to_dict` in `main.py`)
 - `arguments` in tool_calls must be parsed from JSON string to dict before template sees it
 - Model sometimes outputs orphaned `</think>` tags — `clean_output` in `main.py` strips these
+- Think content must be stripped from assistant history messages — only post-think text is stored
 
 ### Context truncation (main.py)
-`truncate_messages` keeps: system + first non-system message (original query) + last message,
-then fills the middle from the end backwards. Prevents OOM on long sessions.
+`truncate_messages` keeps: system + last user message (anchor) + fills backwards from most recent.
+Prevents OOM on long sessions. Anchors on the *most recent* user message to avoid resurrecting stale tasks.
 
-## Known Bugs (observed April 15 2026)
+## Known Bugs (observed April 2026)
 
 ### Bug 1 — Truncation resurrects wrong task (CRITICAL)
 **Symptom:** Agent abandons the current task mid-way and restarts a completely different, earlier task.  
 **Root cause:** `truncate_messages` always keeps the *first* non-system user message as an anchor. In a multi-turn session the first message is the opening task (e.g. `cargo test`), not the current one. After heavy truncation (`kept_turns=0`) the model only sees system + that stale first message and believes it is starting fresh on that task.  
-**Observed:** "What files are in src/?" task → model called 9 reads in parallel → context blown → model restarted `cargo test`. Same for "search terminal_sessions".  
-**Fix (main.py `truncate_messages`):** Anchor on the *most recent* user message, not the first. Keep system + last user message + fill backwards. Alternatively, tag the current task as a system message so it survives truncation.
+**Fix (main.py `truncate_messages`):** Anchor on the *most recent* user message, not the first.
 
 ### Bug 2 — Tool call injection from web content (HIGH)
-**Symptom:** After `web_fetch_tool` returns a page that contains `<function=…>` XML (e.g. Qwen docs showing tool call format as code examples), the `xml_function_parameters` parser fires on that content and executes the embedded examples as real tool calls.  
-**Root cause:** The parser scans the *entire* assistant output including text the model quoted verbatim from fetched pages. There is no sanitization step.  
-**Observed:** Fetching Qwen function-calling docs caused a cascade of spurious tool calls (`extract_tool_calls count=1` on what was a summary message), including a random `cargo test` invocation.  
-**Fix (main.py):** Before inserting a `web_fetch` or `web_search` result into the conversation, escape or strip any `<function=`, `<tool_call>`, `</tool_call>` sequences in the content. The model should never see unescaped tool-call XML in tool *results*.
-
-### Bug 3 — Model runs unsolicited build/test commands (MEDIUM)
-**Symptom:** After reading files the model occasionally runs `cargo build --release` or `cargo test` without being asked, treating it as a self-verification step.  
-**Root cause:** Context confusion after truncation, combined with no system-prompt rule prohibiting unsolicited builds.  
-**Fix (SYSTEM_PROMPT in agent_loop.rs):** Add a rule: *"Never run build or test commands unless the user explicitly asks for it."*
-
-### Bug 4 — Over-reading on directory listing tasks (LOW)
-**Symptom:** When asked "what files are in src/?" the model lists the directory then immediately reads every file in it (9 parallel reads), bloating context and triggering Bug 1.  
-**Root cause:** No system-prompt rule limiting reads to what was asked.  
-**Fix (SYSTEM_PROMPT):** Add a rule: *"When asked to list files, use list_dir and answer from the names alone unless the user asks what each file does. Only read a file if you have a specific reason to."*
+**Symptom:** After `web_fetch_tool` returns a page that contains `<function=…>` XML, the parser fires on that content and executes the embedded examples as real tool calls.  
+**Fix (main.py):** Escape `<function=`, `<tool_call>`, `</tool_call>` sequences in tool results before inserting into conversation. ✅ Done for `role: "tool"` messages via `message_to_dict`.
 
 ### Persistence
 - Session history: `~/.mlx-acp-agent/history/<session_id>.json`
