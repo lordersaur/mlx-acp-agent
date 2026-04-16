@@ -9,7 +9,8 @@
       "Bash(sed -i '' 's/\\\\.complete\\(&messages, &\\\\[\\\\], 2200, 0\\\\.0\\)/.complete\\(\\\\&messages, \\\\&[], 2200, 0.0, None\\)/' /Users/daxel/mlx-acp-agent/src/tools/mod.rs)",
       "Bash(sed -i '' 's/\\\\.complete\\(&content_messages, &\\\\[\\\\], 1400, 0\\\\.1\\)/.complete\\(\\\\&content_messages, \\\\&[], 1400, 0.1, None\\)/' /Users/daxel/mlx-acp-agent/src/tools/mod.rs)",
       "Bash(sed -i '' 's/model\\\\.complete\\(&messages, &\\\\[\\\\], 20, 0\\\\.0\\)/model.complete\\(\\\\&messages, \\\\&[], 20, 0.0, None\\)/' /Users/daxel/mlx-acp-agent/src/tools/mod.rs)",
-      "Bash(sed -i '' 's/model\\\\.complete\\(&messages, &\\\\[\\\\], 40, 0\\\\.0\\)/model.complete\\(\\\\&messages, \\\\&[], 40, 0.0, None\\)/' /Users/daxel/mlx-acp-agent/src/tools/mod.rs)"
+      "Bash(sed -i '' 's/model\\\\.complete\\(&messages, &\\\\[\\\\], 40, 0\\\\.0\\)/model.complete\\(\\\\&messages, \\\\&[], 40, 0.0, None\\)/' /Users/daxel/mlx-acp-agent/src/tools/mod.rs)",
+      "Bash(git fetch *)"
     ]
   }
 }

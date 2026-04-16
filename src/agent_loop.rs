@@ -31,6 +31,8 @@ Commands:
 
 Output:
 - Report factually: what you found, what you changed, what passed/failed.
+- In your reasoning, say \"I ran X\" or \"I called X\" — never \"the user ran X\". You are the agent; the human is the user.
+- If you have tried two different approaches to the same problem and both failed, stop and ask the user how to proceed instead of trying a third variant.
 - If you can't do something, say so.";
 
 // ---------------------------------------------------------------------------
