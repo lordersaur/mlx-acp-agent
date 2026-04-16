@@ -54,6 +54,13 @@ Reuse evidence already gathered instead of re-reading the same files.\n\
 Validate changes (compile, test) when the user asks or after non-trivial edits.",
     ),
     (
+        "fast",
+        "/no_think\nCurrent mode: fast.\n\
+You may inspect the repo, search the web, fetch URLs, run commands, \
+manage terminal sessions, create/edit/delete files, and validate results.\n\
+Respond directly and concisely — skip internal reasoning.",
+    ),
+    (
         "agent",
         "Current mode: agent.\n\
 You may inspect the repo, search the web, fetch URLs, run commands, \
@@ -479,7 +486,7 @@ impl AcpServer {
             .to_owned();
 
         info!("session/set_mode session_id={session_id} mode={mode_id}");
-        let valid_modes = ["ask", "edit", "agent"];
+        let valid_modes = ["ask", "edit", "agent", "fast"];
         if valid_modes.contains(&mode_id.as_str()) {
             let mut map = self.sessions.lock().unwrap();
             if let Some(entry) = map.get_mut(&session_id) {
@@ -1613,6 +1620,11 @@ fn session_modes() -> Value {
             "id": "agent",
             "name": "Agent",
             "description": "Full coding-agent mode with repo search, web access, shell, edits, and validation.",
+        },
+        {
+            "id": "fast",
+            "name": "Fast",
+            "description": "Agent mode without extended thinking — faster responses.",
         },
     ])
 }

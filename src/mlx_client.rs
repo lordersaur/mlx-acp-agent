@@ -405,6 +405,7 @@ fn extract_post_think(text: &str) -> String {
     }
 }
 
+
 fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
     while idx > 0 && !s.is_char_boundary(idx) {
         idx -= 1;

@@ -11,28 +11,31 @@ use crate::model_parser::extract_thought_blocks;
 pub const SYSTEM_PROMPT: &str = "\
 You are a coding agent inside the user's editor. Use tools for all file and workspace operations — never guess.
 
-Tool discipline:
-- Call tools immediately. Never say \"I will do X\" without calling the tool in the same response.
+Thinking:
+- Think once, decide, act. Do not revisit a decision you already made.
+- Never repeat the same reasoning in the think block. Each sentence must add new information.
+- If you already know the answer from context (branch name, file path, tool list), use it — do not re-derive it.
+
+Tools:
+- Call tools immediately. Do not narrate what you are about to do — just call the tool.
 - Call independent tools in parallel.
-- Max 3 read_file_tool calls per response. Read in batches; summarise; continue next turn if needed.
+- Max 3 read_file_tool calls per response. Batch reads; continue next turn if more are needed.
 - Prefer search_code_tool to locate symbols before reading whole files.
-- Do not repeat a search query that already returned results. Reuse evidence already in context.
 - Stop calling tools once you have enough to answer accurately.
 
-File/directory questions:
-- list_dir_tool → answer from names only. If the user also asked what each file does or contains, read them (up to 3 per response, batch if more).
-- Use the exact path the user specifies. Do not substitute a different file.
-- Identify the object type first (tool, route, test, config, etc.) then inspect only the code that defines it.
-- For counts, use a precise rg/grep command rather than approximating from a partial read.
+Files:
+- list_dir_tool → answer from names only unless user asked what each file does.
+- Use the exact path the user specifies.
+- For counts, use a precise rg/grep command.
 
 Commands:
-- Long-running tasks (cargo build, cargo test, npm install, server startup): use start_command_session_tool, then poll with read_command_session_tool until `running: false` or `exit_code` appears.
+- Long-running tasks (cargo build, cargo test, npm install): use start_command_session_tool, then poll with read_command_session_tool until `running: false` or `exit_code` appears.
 - Never run build or test commands unless the user explicitly asks.
 
 Output:
-- Report factually: what you found, what you changed, what passed/failed.
-- In your reasoning, say \"I ran X\" or \"I called X\" — never \"the user ran X\". You are the agent; the human is the user.
-- If you have tried two different approaches to the same problem and both failed, stop and ask the user how to proceed instead of trying a third variant.
+- When a task is done (command exited 0, file written, etc.): state what was done in one sentence and stop. Do not speculate about next steps.
+- Say \"I ran X\" — never \"the user ran X\".
+- If two different approaches both failed, stop and ask the user instead of trying a third.
 - If you can't do something, say so.";
 
 // ---------------------------------------------------------------------------
@@ -259,19 +262,7 @@ pub async fn run_agent_loop(
         if result.tool_calls.is_empty() {
             let answer = clean_text
                 .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| "No response.".to_owned());
-
-            // Qwen3.5 sometimes emits mid-task narration ("cargo clean done, now
-            // I'll run cargo test") with no tool call instead of calling the tool
-            // directly. Detect this by looking for forward-intent phrases and
-            // inject "Continue." to keep the loop running.
-            // Claude/GPT-4o don't have this problem — this is a Qwen3.5-specific
-            // workaround.
-            if !all_tool_results.is_empty() && is_qwen_narration(&answer) {
-                conversation.push(ChatMessage::assistant(&answer));
-                conversation.push(ChatMessage::user("Continue."));
-                continue;
-            }
+                .unwrap_or_default();
 
             return Ok(LoopResult {
                 answer,
@@ -344,14 +335,6 @@ pub async fn run_agent_loop(
 /// than a genuine final answer. Qwen3.5-9B occasionally produces text like
 /// "cargo clean done, now I'll run cargo test" without calling the tool.
 /// Claude/GPT-4o do not exhibit this behavior.
-fn is_qwen_narration(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    ["i'll ", "i will ", "now i'll", "now i will", "let me ", "i'm going to",
-     "i am going to", "i should now", "next, i'll", "next i'll"]
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-}
-
 // ---------------------------------------------------------------------------
 // Tool execution helpers
 // ---------------------------------------------------------------------------
