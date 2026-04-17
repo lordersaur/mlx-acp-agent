@@ -659,8 +659,8 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("Max 3 read_file_tool calls per response"));
         assert!(SYSTEM_PROMPT.contains("Never run build or test commands"));
         assert!(SYSTEM_PROMPT.contains("answer from names only"));
-        assert!(SYSTEM_PROMPT.contains("Do not repeat a search query"));
-        assert!(SYSTEM_PROMPT.contains("object type"));
+        assert!(SYSTEM_PROMPT.contains("search_code_tool"));
+        assert!(SYSTEM_PROMPT.contains("one sentence"));
         assert!(SYSTEM_PROMPT.contains("start_command_session_tool"));
         assert!(SYSTEM_PROMPT.contains("read_command_session_tool"));
     }

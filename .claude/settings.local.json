@@ -10,7 +10,15 @@
       "Bash(sed -i '' 's/\\\\.complete\\(&content_messages, &\\\\[\\\\], 1400, 0\\\\.1\\)/.complete\\(\\\\&content_messages, \\\\&[], 1400, 0.1, None\\)/' /Users/daxel/mlx-acp-agent/src/tools/mod.rs)",
       "Bash(sed -i '' 's/model\\\\.complete\\(&messages, &\\\\[\\\\], 20, 0\\\\.0\\)/model.complete\\(\\\\&messages, \\\\&[], 20, 0.0, None\\)/' /Users/daxel/mlx-acp-agent/src/tools/mod.rs)",
       "Bash(sed -i '' 's/model\\\\.complete\\(&messages, &\\\\[\\\\], 40, 0\\\\.0\\)/model.complete\\(\\\\&messages, \\\\&[], 40, 0.0, None\\)/' /Users/daxel/mlx-acp-agent/src/tools/mod.rs)",
-      "Bash(git fetch *)"
+      "Bash(git fetch *)",
+      "WebFetch(domain:zed.dev)",
+      "Read(//Users/daxel/**)",
+      "Bash(mkdir /Users/daxel/python-mlx-sv)",
+      "Bash(cp /Users/daxel/main.py /Users/daxel/python-mlx-sv/main.py)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "WebFetch(domain:ollama.com)"
     ]
   }
 }

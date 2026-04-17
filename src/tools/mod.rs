@@ -14,7 +14,6 @@ pub mod command;
 pub mod fs;
 pub mod web;
 
-const DEFAULT_READ_FILE_CHUNK_CHARS: usize = 3000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolProgressEvent {
@@ -96,13 +95,13 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "read_file_tool",
-                    "description": "Read a file from the workspace. Returns up to `limit` chars starting at `offset`. If the file is larger a continuation notice tells you the next offset to use.",
+                    "description": "Read a file from the workspace. Returns up to `limit` lines starting at line `start_line` (1-based). If the file is larger a continuation notice tells you the next start_line to use. search_code_tool returns 1-based line numbers — pass them directly as start_line.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "Path to the file, relative to the workspace root."},
-                            "offset": {"type": "integer", "description": "Char offset to start reading from (default 0)."},
-                            "limit": {"type": "integer", "description": "Max chars to return (default 3000). Increase for larger reads."}
+                            "start_line": {"type": "integer", "description": "1-based line number to start reading from (default 1)."},
+                            "limit": {"type": "integer", "description": "Max number of lines to return (default 100)."}
                         },
                         "required": ["path"]
                     }
@@ -321,14 +320,19 @@ impl BuiltinToolRegistry {
 
     fn invoke_read_file(&self, arguments: Map<String, Value>) -> Result<String> {
         let path = required_string(&arguments, "path")?;
-        let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let start_line = arguments
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(1)
+            .max(1);
         let limit = arguments
             .get("limit")
             .and_then(Value::as_u64)
             .map(|v| v as usize)
-            .unwrap_or(DEFAULT_READ_FILE_CHUNK_CHARS);
+            .unwrap_or(100);
         let content = fs::read_file(&self.workspace_cwd, path)?;
-        Ok(file_chunk(&content, offset, limit))
+        Ok(file_chunk_lines(&content, start_line, limit))
     }
 
     fn invoke_list_dir(&self, arguments: Map<String, Value>) -> Result<String> {
@@ -708,23 +712,30 @@ async fn infer_filename(model: &dyn ModelClient, instruction: &str, kind: &str) 
 // Private helpers
 // ---------------------------------------------------------------------------
 
-fn file_chunk(content: &str, offset: usize, limit: usize) -> String {
-    let total = content.len();
-    if offset >= total {
-        return format!("[offset {offset} is past end of file ({total} chars)]");
+fn file_chunk_lines(content: &str, start_line: usize, limit: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if start_line > total {
+        return format!("[start_line {start_line} is past end of file ({total} lines)]");
     }
-    let start = floor_char_boundary(content, offset);
-    let end = floor_char_boundary(content, (offset + limit).min(total));
-    let chunk = &content[start..end];
-    if end >= total {
-        if offset == 0 {
-            chunk.to_owned()
+    let from = start_line - 1; // convert to 0-based
+    let to = (from + limit).min(total);
+    let chunk = lines[from..to]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{}: {line}", from + i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if to >= total {
+        if start_line == 1 {
+            chunk
         } else {
-            format!("{chunk}\n[End of file. Showed chars {start}–{end} of {total}.]")
+            format!("{chunk}\n[End of file. Showed lines {start_line}–{to} of {total}.]")
         }
     } else {
         format!(
-            "{chunk}\n[Showing chars {start}–{end} of {total}. Call read_file_tool with offset={end} to continue.]"
+            "{chunk}\n[Showing lines {start_line}–{to} of {total}. Call read_file_tool with start_line={} to continue.]",
+            to + 1
         )
     }
 }
@@ -744,13 +755,6 @@ fn optional_bool(arguments: &Map<String, Value>, key: &str) -> Option<bool> {
     arguments.get(key).and_then(Value::as_bool)
 }
 
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    let mut index = index.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
 
 fn ceil_char_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
@@ -1369,25 +1373,33 @@ Body text.
     fn read_file_tool_paginates_large_content() {
         let tempdir = TempDir::new().expect("tempdir");
         let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
-        // File larger than the default 3000-char chunk.
-        let large = "a".repeat(6000);
+        // 250 lines — more than the default 100-line limit.
+        let large = (1..=250).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
         stdfs::write(tempdir.path().join("large.txt"), &large).expect("write large file");
 
-        // First read: default offset=0, limit=3000.
+        // First read: default start_line=1, limit=100.
         let page1 = futures::executor::block_on(registry.invoke(
             "read_file_tool",
             json!({"path": "large.txt"}).as_object().cloned().unwrap(),
         ))
         .expect("invoke page 1");
-        assert!(page1.contains("offset=3000 to continue"), "page 1 should show continuation: {page1}");
+        assert!(page1.contains("start_line=101 to continue"), "page 1 should show continuation: {page1}");
 
-        // Second read: offset=3000 gets the rest.
+        // Second read: start_line=101 gets lines 101-200.
         let page2 = futures::executor::block_on(registry.invoke(
             "read_file_tool",
-            json!({"path": "large.txt", "offset": 3000}).as_object().cloned().unwrap(),
+            json!({"path": "large.txt", "start_line": 101}).as_object().cloned().unwrap(),
         ))
         .expect("invoke page 2");
-        assert!(page2.contains("End of file"), "page 2 should reach end: {page2}");
+        assert!(page2.contains("start_line=201 to continue"), "page 2 should show continuation: {page2}");
+
+        // Third read: start_line=201 gets the rest.
+        let page3 = futures::executor::block_on(registry.invoke(
+            "read_file_tool",
+            json!({"path": "large.txt", "start_line": 201}).as_object().cloned().unwrap(),
+        ))
+        .expect("invoke page 3");
+        assert!(page3.contains("End of file"), "page 3 should reach end: {page3}");
 
         // Small file: returned whole, no continuation notice.
         stdfs::write(tempdir.path().join("small.txt"), "hello").expect("write small file");
@@ -1396,6 +1408,6 @@ Body text.
             json!({"path": "small.txt"}).as_object().cloned().unwrap(),
         ))
         .expect("invoke small");
-        assert_eq!(small, "hello");
+        assert_eq!(small, "1: hello");
     }
 }

@@ -318,8 +318,13 @@ impl MlxClient {
                 .iter()
                 .filter_map(ApiToolCall::from_chat)
                 .collect();
+            // Keep only pre-tool-call text; the tool XML itself is not user-facing.
+            let text = match content.find("<tool_call>") {
+                Some(idx) => content[..idx].trim().to_owned(),
+                None => content,
+            };
             return Ok(CompletionResult {
-                content: if content.is_empty() { None } else { Some(content) },
+                content: if text.is_empty() { None } else { Some(text) },
                 tool_calls: api_calls,
             });
         }
@@ -343,6 +348,10 @@ enum ThinkState {
 
 /// Feed a delta token into the think state machine.
 /// Sends content that falls inside `<think>…</think>` to `tx`.
+///
+/// Handles two patterns:
+/// - Explicit: `<think>…content…</think>` (model emits the open tag)
+/// - Pre-filled: `…content…</think>` (Qwen3.5 — open tag is in the prompt, not the output)
 fn stream_think_chunk(
     state: &mut ThinkState,
     buf: &mut String,
@@ -353,16 +362,31 @@ fn stream_think_chunk(
     loop {
         match state {
             ThinkState::Before => {
-                if let Some(idx) = buf.find("<think>") {
-                    let after = buf[idx + "<think>".len()..].to_owned();
-                    *buf = after;
+                let close_pos = buf.find("</think>");
+                let open_pos = buf.find("<think>");
+                let pre_filled = close_pos.map_or(false, |ci| open_pos.map_or(true, |oi| ci <= oi));
+                if pre_filled {
+                    // </think> comes before any <think> — pre-filled thinking (Qwen3.5).
+                    let ci = close_pos.unwrap();
+                    let thinking = buf[..ci].trim().to_owned();
+                    if !thinking.is_empty() {
+                        tx.send(thinking).ok();
+                    }
+                    *buf = buf[ci + "</think>".len()..].to_owned();
+                    *state = ThinkState::After;
+                    break;
+                } else if let Some(oi) = open_pos {
+                    // Explicit <think> tag — standard mode.
+                    *buf = buf[oi + "<think>".len()..].to_owned();
                     *state = ThinkState::Inside;
-                    // loop to check if </think> is already in buf
+                    // loop: check if </think> is already in buf
                 } else {
-                    // Keep last few bytes so a split `<think>` tag isn't missed.
-                    let keep = buf.len().saturating_sub(7);
-                    let keep = floor_char_boundary(buf, keep);
-                    buf.drain(..keep);
+                    // Neither tag seen yet — buffer and wait.
+                    // If buffer grows too large the model isn't doing thinking (Fast mode).
+                    if buf.len() > 4096 {
+                        *state = ThinkState::After;
+                        buf.clear();
+                    }
                     break;
                 }
             }

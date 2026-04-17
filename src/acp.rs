@@ -605,7 +605,7 @@ impl AcpServer {
         let options = AgentLoopOptions::default();
 
         // Send initial thought
-        self.send_thought(&session_id, &format!("Mode: {mode_id}. Working..."));
+        // self.send_thought(&session_id, &format!("Mode: {mode_id}. Working..."));
 
         let my_task_id = self.next_task_id.fetch_add(1, Ordering::SeqCst);
 
@@ -1395,10 +1395,6 @@ impl ToolExecutor for ProgressRegistry {
     async fn invoke(&self, name: &str, arguments: Map<String, Value>) -> Result<String> {
         let tool_call_id = self.next_tool_call_id(name);
 
-        // Send "tool started" thought and ACP tool_call event
-        if let Some(msg) = render_tool_started(name, &arguments) {
-            self.send_thought_raw(&msg);
-        }
         // ACP tool_call event
         let kind = tool_kind(name);
         let primary = primary_value(&arguments);
@@ -1479,24 +1475,18 @@ impl ToolExecutor for ProgressRegistry {
             self.inner.invoke(name, arguments.clone()).await
         };
 
-        // Send "tool finished" thought and ACP tool_call_update event
-        let (thought_text, update_text, raw_output, is_error) = match &result {
+        // ACP tool_call_update event
+        let (update_text, raw_output, is_error) = match &result {
             Ok(output) => {
-                let rendered = render_tool_finished(name, &arguments, output);
-                let update_text = rendered.clone().unwrap_or_else(|| "Completed.".to_owned());
-                let raw_output = Some(parse_tool_output(output));
-                (rendered, update_text, raw_output, false)
+                let update_text = render_tool_finished(name, &arguments, output)
+                    .unwrap_or_else(|| "Completed.".to_owned());
+                (update_text, Some(parse_tool_output(output)), false)
             }
-            Err(e) => (
-                Some(format!("Error: {e}")),
-                format!("Error: {e}"),
-                Some(Value::String(e.to_string())),
-                true,
-            ),
+            Err(e) => {
+                self.send_thought_raw(&format!("Error: {e}"));
+                (format!("Error: {e}"), Some(Value::String(e.to_string())), true)
+            }
         };
-        if let Some(text) = &thought_text {
-            self.send_thought_raw(text);
-        }
 
         let status = if is_error { "error" } else { "completed" };
         let mut update = json!({
@@ -2321,7 +2311,6 @@ mod tests {
 
         let updates = drain_updates(&mut rx);
         let thoughts = thought_texts(&updates);
-        assert!(thoughts.iter().any(|t| t.contains("Creating `<auto>`.")));
         assert!(
             thoughts
                 .iter()
@@ -2393,7 +2382,6 @@ mod tests {
             .expect("invoke");
 
         let thoughts = thought_texts(&drain_updates(&mut rx));
-        assert!(thoughts.iter().any(|t| t.contains("Editing `notes.txt`.")));
         assert!(
             thoughts
                 .iter()
