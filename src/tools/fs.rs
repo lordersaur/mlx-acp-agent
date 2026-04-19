@@ -40,7 +40,8 @@ pub fn safe_path(cwd: &Path, path: &str) -> Result<PathBuf> {
 
 pub fn read_file(cwd: &Path, path: &str) -> Result<String> {
     let file = safe_path(cwd, path)?;
-    fs::read_to_string(&file).with_context(|| format!("failed to read {}", file.display()))
+    fs::read_to_string(&file)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", file.display()))
 }
 
 pub fn write_file(cwd: &Path, path: &str, content: &str) -> Result<String> {
@@ -56,7 +57,7 @@ pub fn write_file(cwd: &Path, path: &str, content: &str) -> Result<String> {
 pub fn list_dir(cwd: &Path, path: &str) -> Result<Vec<String>> {
     let directory = safe_path(cwd, path)?;
     let mut entries = fs::read_dir(&directory)
-        .with_context(|| format!("failed to list {}", directory.display()))?
+        .map_err(|error| anyhow::anyhow!("failed to list {}: {error}", directory.display()))?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let name = entry.file_name();
@@ -281,12 +282,24 @@ mod tests {
 
         let error = read_file(tempdir.path(), "tools/mod.rs").expect_err("missing file");
 
-        let debug = format!("{error:?}");
-        assert!(debug.contains("failed to read"));
-        assert!(debug.contains("tools/mod.rs"));
-        assert!(debug.contains("No such file") || debug.contains("os error"));
-        assert!(!debug.contains("search_code_tool"));
-        assert!(!debug.contains("list_dir_tool"));
+        let display = error.to_string();
+        assert!(display.contains("failed to read"));
+        assert!(display.contains("tools/mod.rs"));
+        assert!(display.contains("No such file") || display.contains("os error"));
+        assert!(!display.contains("search_code_tool"));
+        assert!(!display.contains("list_dir_tool"));
+    }
+
+    #[test]
+    fn list_dir_reports_actual_missing_path_error() {
+        let tempdir = TempDir::new().expect("tempdir");
+
+        let error = list_dir(tempdir.path(), "tools").expect_err("missing directory");
+
+        let display = error.to_string();
+        assert!(display.contains("failed to list"));
+        assert!(display.contains("tools"));
+        assert!(display.contains("No such file") || display.contains("os error"));
     }
 
     #[test]

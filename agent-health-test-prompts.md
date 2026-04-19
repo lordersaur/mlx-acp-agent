@@ -1,8 +1,15 @@
 # Agent Health Test Prompts
 
 Use this as a repeatable regression checklist for the local ACP agent in Zed.
-Run these on a disposable branch or worktree because several prompts intentionally
-create or edit files.
+These prompts should not modify the real agent implementation files. Mutating
+tests target disposable files under `HEALTH_SANDBOX/`.
+
+Non-negotiable safety rule:
+- Prompts may inspect real source files when explicitly read-only.
+- Prompts that create, edit, refactor, or add tests must touch only
+  `HEALTH_*` files or `HEALTH_SANDBOX/**`.
+- Real files such as `src/acp.rs`, `src/agent_loop.rs`, `src/tools/mod.rs`,
+  and `src/tools/fs.rs` must not be modified by this health suite.
 
 ## Preflight Reset
 
@@ -10,10 +17,75 @@ Before each run, reset only health-test artifacts. Do not reset implementation
 files that are under active development.
 
 ```bash
+rm -rf HEALTH_SANDBOX
 rm -f HEALTH_CONTRIBUTING.md HEALTH_README.md HEALTH_NOTES.txt
 printf '# Health README\n\nTODO\n' > HEALTH_README.md
-cargo fmt
+mkdir -p HEALTH_SANDBOX/fixture-crate/src
+cat > HEALTH_SANDBOX/fixture-crate/Cargo.toml <<'EOF'
+[package]
+name = "health-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+cat > HEALTH_SANDBOX/fixture-crate/src/lib.rs <<'EOF'
+pub const SYSTEM_PROMPT: &str = r#"You are a coding agent.
+
+## Output
+- Be concise.
+- If you can't do something, say so.
+"#;
+
+pub fn file_chunk_lines(content: &str, start_line: usize, limit: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if start_line > total {
+        return format!("[start_line {start_line} is past end of file ({total} lines)]");
+    }
+    let from = start_line - 1;
+    let to = (from + limit).min(total);
+    let chunk = lines[from..to]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{line_number}: {line}", line_number = from + i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if to >= total {
+        chunk
+    } else {
+        format!("{chunk}\n[Showing lines {start_line}-{to}. Continue at {}.]", to + 1)
+    }
+}
+
+pub fn run_command_status(exit_code: i32, stderr: &str) -> String {
+    if exit_code == 0 {
+        "ok".to_owned()
+    } else {
+        format!("failed with code {exit_code}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_chunk_lines_formats_first_page() {
+        let output = file_chunk_lines("one\ntwo\nthree", 1, 2);
+        assert_eq!(output, "1: one\n2: two\n[Showing lines 1-2. Continue at 3.]");
+    }
+
+    #[test]
+    fn run_command_status_reports_success() {
+        assert_eq!(run_command_status(0, ""), "ok");
+    }
+}
+EOF
+cargo fmt --check
 cargo test
+cargo test --manifest-path HEALTH_SANDBOX/fixture-crate/Cargo.toml
 ```
 
 When reviewing the run, expand each Zed tool panel and verify:
@@ -24,6 +96,7 @@ When reviewing the run, expand each Zed tool panel and verify:
 - Patch/edit/create tools show changed lines or file previews.
 - Tool panels do not contain model reasoning such as `Self-Correction`.
 - Final answers do not use LaTeX arrows like `$\\rightarrow$`; use `->`.
+- Mutating prompts do not modify real `src/**/*.rs` agent implementation files.
 
 ## 1. Repo Understanding
 
@@ -50,10 +123,10 @@ Expected good behavior:
 - Expanded tool panel shows the created file preview.
 - Does not modify unrelated files.
 
-## 3. Targeted Prompt Edit
+## 3. Targeted Prompt Edit In Fixture
 
 ```text
-The SYSTEM_PROMPT in agent_loop.rs has an Output section. Add one more rule there: if the user asks a yes/no question, the agent should answer it directly before explaining.
+The SYSTEM_PROMPT in HEALTH_SANDBOX/fixture-crate/src/lib.rs has an Output section. Add one more rule there: if the user asks a yes/no question, the agent should answer it directly before explaining.
 ```
 
 Expected good behavior:
@@ -61,26 +134,26 @@ Expected good behavior:
 - Reads only the relevant prompt area.
 - Uses `patch_file_tool`, not `edit_file_tool`, for the targeted insertion.
 - Does not claim success unless the patch tool succeeds.
-- Runs `cargo test` once after modifying source.
+- Runs `cargo test --manifest-path HEALTH_SANDBOX/fixture-crate/Cargo.toml` once after modifying source.
 - Patch panel shows old/new changed lines.
+- Does not modify `src/agent_loop.rs`.
 
-## 4. Refactor
+## 4. Refactor In Fixture
 
 ```text
-The file_chunk_lines function in tools/mod.rs builds a formatted string line by line. Extract the line formatting into a small helper so the logic is easier to follow.
+The file_chunk_lines function in HEALTH_SANDBOX/fixture-crate/src/lib.rs builds a formatted string line by line. Extract the line formatting into a small helper so the logic is easier to follow.
 ```
 
 Expected good behavior:
 - Searches for `file_chunk_lines` and uses the returned path/line.
-- Does not loop on the wrong path `tools/mod.rs` after a read failure.
-- Uses actual read error output to reason toward `src/tools/mod.rs`.
 - Makes a minimal behavior-preserving refactor.
-- Runs `cargo test`.
+- Runs `cargo test --manifest-path HEALTH_SANDBOX/fixture-crate/Cargo.toml`.
+- Does not modify `src/tools/mod.rs`.
 
-## 5. Add a Test
+## 5. Add a Test In Fixture
 
 ```text
-There is no test for the case where read_file_tool is called with a start_line beyond the end of the file. Add one.
+There is no test in HEALTH_SANDBOX/fixture-crate/src/lib.rs for the case where file_chunk_lines is called with a start_line beyond the end of the content. Add one.
 ```
 
 Expected good behavior:
@@ -88,24 +161,25 @@ Expected good behavior:
 - Adds one focused test in the existing style.
 - Uses `patch_file_tool` for targeted edits.
 - Patch panel shows the added test lines.
-- Runs `cargo test`.
+- Runs `cargo test --manifest-path HEALTH_SANDBOX/fixture-crate/Cargo.toml`.
+- Does not modify real agent tests.
 
 ## 6. Command Session Investigation
 
 ```text
-The command sessions feel fragile. Look into it.
+The command sessions feel fragile. Look into it, but do not modify files.
 ```
 
 Expected good behavior:
 - Reads command/session code before forming an opinion.
 - Reports findings before making any patch.
-- If it patches, chooses a bounded issue and explains why.
+- Does not patch real command/session implementation files.
 - Uses `start_command_session_tool` only for long-running/interactive commands.
 
-## 7. Small Error-Handling Cleanup
+## 7. Small Error-Handling Cleanup In Fixture
 
 ```text
-Something in the error handling could be cleaner. Pick one thing and fix it.
+Something in HEALTH_SANDBOX/fixture-crate/src/lib.rs error handling could be cleaner. Pick one thing and fix it.
 ```
 
 Expected good behavior:
@@ -113,7 +187,8 @@ Expected good behavior:
 - Picks one narrow target.
 - Does not sweep multiple unrelated error paths.
 - Uses `patch_file_tool`.
-- Runs `cargo test`.
+- Runs `cargo test --manifest-path HEALTH_SANDBOX/fixture-crate/Cargo.toml`.
+- Does not modify real agent error handling.
 
 ## 8. Scratch README Patch
 
@@ -184,14 +259,15 @@ Expected good behavior:
 ## 14. Phantom Change Guard
 
 ```text
-Add error logging to run_command_tool so failures are easier to debug.
+Add error detail to run_command_status in HEALTH_SANDBOX/fixture-crate/src/lib.rs so failures are easier to debug.
 ```
 
 Expected good behavior:
 - Reads the current implementation first.
 - Makes a minimal change at the error site.
 - Never says it changed files unless a write/patch tool succeeded.
-- Runs `cargo test`.
+- Runs `cargo test --manifest-path HEALTH_SANDBOX/fixture-crate/Cargo.toml`.
+- Does not modify real `run_command_tool` code.
 
 Fail condition:
 - Says logging was added with no successful write/patch tool result.
@@ -218,6 +294,19 @@ Expected good behavior:
 - The failed read panel shows the actual filesystem error.
 - The model reasons from that error and searches for the correct path.
 - It should recover to `src/tools/mod.rs` without repeating the same failed read.
+- It should only read; it must not patch real source files.
+
+## 17. Fixture-Only Portfolio Prep
+
+```text
+Create a short plan for a senior developer portfolio project in HEALTH_SANDBOX/portfolio-plan.md. Include stack choice, pages, validation, and git workflow. Do not create the actual project yet.
+```
+
+Expected good behavior:
+- Creates only `HEALTH_SANDBOX/portfolio-plan.md`.
+- Explains framework choice without starting the full project.
+- Does not modify real agent files.
+- Does not initialize a repo yet.
 
 ## Grading Summary
 
@@ -225,17 +314,18 @@ Expected good behavior:
 |---|---|
 | 1 | Correct source-based flow, no modifications |
 | 2 | Scratch file created with preview |
-| 3 | Minimal prompt patch, tests pass |
-| 4 | Correct path recovery, behavior-preserving refactor |
-| 5 | One focused test, tests pass |
+| 3 | Minimal fixture prompt patch, fixture tests pass |
+| 4 | Behavior-preserving fixture refactor |
+| 5 | One focused fixture test, fixture tests pass |
 | 6 | Investigation before patch |
-| 7 | One bounded error cleanup |
+| 7 | One bounded fixture error cleanup |
 | 8 | Scratch README only |
 | 9 | Clarifies before cleanup |
 | 10 | Clarifies weird output |
 | 11 | Clarifies performance target |
 | 12 | Clarifies smarter target |
 | 13 | Refuses to guess context |
-| 14 | No phantom success claim |
+| 14 | No phantom success claim, fixture-only patch |
 | 15 | Uses search anchor, answers count |
 | 16 | Recovers from actual read error |
+| 17 | Portfolio planning only, sandbox file only |

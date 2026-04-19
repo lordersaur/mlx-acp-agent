@@ -251,13 +251,13 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "patch_file_tool",
-                    "description": "Apply a targeted text patch to an existing file.\n\nUse this when you know the exact snippet to replace and want a safer scoped edit than rewriting the entire file.\nRead or search the file first so the patch target is precise.",
+                    "description": "Apply a targeted text patch to an existing file.\n\nUse this when you know the exact snippet to replace and want a safer scoped edit than rewriting the entire file.\nRead or search the file first so the patch target is precise. Keep patches small: replace a single expression, helper, or adjacent block instead of an entire function whenever possible.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "Path to the file to patch, relative to the workspace root."},
-                            "old_text": {"type": "string", "description": "Exact existing text to replace."},
-                            "new_text": {"type": "string", "description": "Replacement text."},
+                            "old_text": {"type": "string", "description": "Exact existing text to replace. Keep this small and scoped; do not paste an entire function unless unavoidable."},
+                            "new_text": {"type": "string", "description": "Replacement text. Keep this small and scoped; prefer adding a helper plus one call-site change over rewriting a whole function."},
                             "replace_all": {"type": "boolean", "description": "Whether to replace every occurrence instead of just one."}
                         },
                         "required": ["path", "old_text", "new_text"]

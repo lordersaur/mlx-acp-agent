@@ -26,10 +26,11 @@ Tools:
 - BANNED: reading a file at start_line: 1 after search_code_tool already returned a line number for that file. BANNED: reading a file in sequential 100-line pages (start_line: 1, 101, 201…). Both are top-to-bottom paging and waste turns. If you catch yourself about to do either, stop and use search_code_tool instead.
 - For explain-the-flow or trace-how-X-works tasks: search for specific function names (e.g. handle_session_prompt, run_agent_loop, persist_session), not broad keywords or module names. search_code_tool returns 3 lines of context around each match — if that is enough, answer directly. If not, read only that function using the returned line number as start_line.
 - Never answer implementation questions from CLAUDE.md, README, or comments alone. If the question is about how code works, search the actual source and read the relevant function before answering.
-- Use patch_file_tool for all targeted changes: adding lines, modifying values, appending code. Use edit_file_tool only when rewriting an entire file from scratch — keep the instruction one plain sentence, no quoted text inside it.
+- Use patch_file_tool for all targeted changes: adding lines, modifying values, appending code. Keep patch_file_tool old_text/new_text as small as possible: prefer replacing a single expression or inserting one helper over replacing a whole function. Use edit_file_tool only when rewriting an entire file from scratch — keep the instruction one plain sentence, no quoted text inside it.
 - Never announce that you are about to make a change and then stop. Call the tool immediately or say you cannot do it.
 - Never claim to have made a change unless patch_file_tool or edit_file_tool returned successfully. If the last tool call was not one of those, no file was modified — do not say it was.
 - If the user asks a yes/no question, the agent should answer it directly before explaining.
+- If the requested change already exists, say so and do not patch the file.
 - Do not write meta labels like \"Self-Correction\", \"Refinement\", or similar process notes in thoughts or answers.
 
 Files:
@@ -275,6 +276,7 @@ pub async fn run_agent_loop(
             let answer = clean_text
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_default();
+            let answer = prevent_malformed_tool_call_answer(answer);
             let answer = prevent_unsupported_completion_claims(answer, &all_tool_results);
 
             return Ok(LoopResult {
@@ -441,14 +443,39 @@ fn prevent_unsupported_completion_claims(answer: String, tool_results: &[ToolExe
             .to_owned();
     }
 
-    let claims_tests_passed = lower.contains("test")
-        && (lower.contains("passed") || lower.contains("pass") || lower.contains("cargo test"));
+    let first_person_command_claim = [
+        "i ran",
+        "i run",
+        "i executed",
+        "i have run",
+        "i have executed",
+        "i've run",
+        "i've executed",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    let claims_tests_passed = (first_person_completion_claim || first_person_command_claim)
+        && (lower.contains("test passed")
+            || lower.contains("tests passed")
+            || lower.contains("tests pass")
+            || lower.contains("cargo test passed"));
     if claims_tests_passed && !has_successful_command_result() {
         return "I do not have a successful command result confirming that tests passed."
             .to_owned();
     }
 
     answer
+}
+
+fn prevent_malformed_tool_call_answer(answer: String) -> String {
+    if answer.contains("<|tool_call>") || answer.contains("<tool_call>") {
+        return "I tried to call a tool, but the tool call was malformed and could not be executed."
+            .to_owned();
+    }
+
+    answer
+        .replace("$\\rightarrow$", "->")
+        .replace("$\\to$", "->")
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +899,62 @@ mod tests {
 
         assert_eq!(result.answer, "Patched README.md.");
         assert_eq!(result.tool_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reports_malformed_tool_call_instead_of_raw_marker_text() {
+        let model = MockModel::new(vec![text_response(
+            r#"<|tool_call>call:create_artifact_tool{filename:"HEALTH_CONTRIBUTING.md",instruction:## Contributing
+
+Run `cargo test`.<tool_call|>"#,
+        )]);
+        let tools = MockTools::with_outputs(HashMap::new());
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new(
+                "user",
+                "Create the contributing file.",
+            )],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(
+            result.answer,
+            "I tried to call a tool, but the tool call was malformed and could not be executed."
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_documentation_that_mentions_cargo_test_without_command_result() {
+        let model = MockModel::new(vec![text_response(
+            "Build with `cargo build` and run tests with `cargo test`.",
+        )]);
+        let tools = MockTools::with_outputs(HashMap::new());
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new(
+                "user",
+                "Draft contributing instructions.",
+            )],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(
+            result.answer,
+            "Build with `cargo build` and run tests with `cargo test`."
+        );
     }
 
     #[tokio::test]

@@ -1486,11 +1486,14 @@ impl ToolExecutor for ProgressRegistry {
                     .unwrap_or_else(|| "Completed.".to_owned());
                 (update_text, Some(parse_tool_output(output)), false)
             }
-            Err(e) => (
-                render_tool_error(name, &arguments, &format!("{e:?}")),
-                Some(Value::String(format!("{e:?}"))),
-                true,
-            ),
+            Err(e) => {
+                let error = e.to_string();
+                (
+                    render_tool_error(name, &arguments, &error),
+                    Some(Value::String(error)),
+                    true,
+                )
+            }
         };
 
         let status = if is_error { "error" } else { "completed" };
@@ -1850,271 +1853,12 @@ fn render_tool_started(name: &str, args: &Map<String, Value>) -> Option<String> 
     })
 }
 
-fn render_tool_finished(name: &str, args: &Map<String, Value>, output: &str) -> Option<String> {
-    let path = str_arg(args, "path");
-    let query = str_arg(args, "query");
-    let url = str_arg(args, "url");
-    let cmd = str_arg(args, "cmd");
-    let session_id = str_arg(args, "session_id");
-
-    Some(match name {
-        "read_file_tool" => append_tool_output(format!("Read `{path}`."), output, "text"),
-        "list_dir_tool" => append_tool_output(
-            format!("Listed `{}`.", if path.is_empty() { "." } else { &path }),
-            output,
-            "text",
-        ),
-        "search_code_tool" => {
-            let matches = output.lines().count();
-            append_tool_output(
-                format!("Found {matches} lines for `{query}`."),
-                output,
-                "text",
-            )
-        }
-        "web_search_tool" => {
-            append_tool_output(format!("Searched the web for `{query}`."), output, "text")
-        }
-        "web_fetch_tool" => {
-            let chars = output.len();
-            append_tool_output(format!("Fetched `{url}` ({chars} chars)."), output, "text")
-        }
-        "run_command_tool" => {
-            if let Some(session_id) = extract_result_line_field(output, "session_id") {
-                if extract_result_line_field(output, "running").as_deref() == Some("true") {
-                    append_tool_output(
-                        format!("`{cmd}` is still running in session `{session_id}`."),
-                        output,
-                        "text",
-                    )
-                } else {
-                    let exit = extract_exit_code(output);
-                    let command_output = extract_command_tail(output, 30);
-                    if command_output.is_empty() {
-                        format!("`{cmd}` exited with code {exit}.")
-                    } else {
-                        format!("`{cmd}` exited with code {exit}.\n```text\n{command_output}\n```")
-                    }
-                }
-            } else {
-                let exit = extract_exit_code(output);
-                let command_output = extract_command_tail(output, 30);
-                if command_output.is_empty() {
-                    format!("`{cmd}` exited with code {exit}.")
-                } else {
-                    format!("`{cmd}` exited with code {exit}.\n```text\n{command_output}\n```")
-                }
-            }
-        }
-        "list_command_sessions_tool" => {
-            let count = serde_json::from_str::<Value>(output)
-                .ok()
-                .and_then(|v| v.as_array().map(|items| items.len()))
-                .unwrap_or(0);
-            append_tool_output(format!("Listed {count} terminal sessions."), output, "json")
-        }
-        "start_command_session_tool" => {
-            // result is JSON with session_id
-            let sid = serde_json::from_str::<Value>(output)
-                .ok()
-                .and_then(|v| {
-                    v.get("session_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_default();
-            append_tool_output(
-                format!("Started terminal session `{sid}` for `{cmd}`."),
-                output,
-                "json",
-            )
-        }
-        "read_command_session_tool" => {
-            let chars = serde_json::from_str::<Value>(output)
-                .ok()
-                .and_then(|v| v.get("output").and_then(|v| v.as_str()).map(|s| s.len()))
-                .unwrap_or(0);
-            append_tool_output(
-                format!("Read {chars} chars from `{session_id}`."),
-                output,
-                "text",
-            )
-        }
-        "write_command_session_tool" => {
-            let chars = serde_json::from_str::<Value>(output)
-                .ok()
-                .and_then(|v| v.get("written_chars").and_then(|v| v.as_u64()))
-                .unwrap_or(0);
-            append_tool_output(
-                format!("Wrote {chars} chars to `{session_id}`."),
-                output,
-                "json",
-            )
-        }
-        "terminate_command_session_tool" => {
-            let exit = serde_json::from_str::<Value>(output)
-                .ok()
-                .and_then(|v| v.get("exit_code").and_then(|v| v.as_i64()))
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "unknown".to_owned());
-            append_tool_output(
-                format!("Terminated `{session_id}` (exit {exit})."),
-                output,
-                "json",
-            )
-        }
-        "delete_path_tool" => append_tool_output(format!("Deleted `{path}`."), output, "json"),
-        "create_artifact_tool" => {
-            let filename = serde_json::from_str::<Value>(output)
-                .ok()
-                .and_then(|v| {
-                    v.get("filename")
-                        .or_else(|| v.get("path"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| str_arg(args, "filename"));
-            if filename.is_empty() {
-                append_tool_output("Created file.".to_owned(), output, "text")
-            } else {
-                append_tool_output(format!("Created `{filename}`."), output, "text")
-            }
-        }
-        "edit_file_tool" => append_tool_output(format!("Updated `{path}`."), output, "text"),
-        "patch_file_tool" => append_tool_output(format!("Patched `{path}`."), output, "diff"),
-        _ => return None,
-    })
+fn render_tool_finished(_name: &str, _args: &Map<String, Value>, output: &str) -> Option<String> {
+    Some(output.to_owned())
 }
 
-fn render_tool_error(name: &str, args: &Map<String, Value>, error: &str) -> String {
-    let summary = format!("{} failed.", render_tool_title(name, args));
-    append_tool_output(summary, error, "text")
-}
-
-fn append_tool_output(summary: String, output: &str, language: &str) -> String {
-    let preview = tool_output_preview(output);
-    if preview.trim().is_empty() {
-        return summary;
-    }
-    format!("{summary}\n```{language}\n{}\n```", escape_fence(&preview))
-}
-
-fn tool_output_preview(output: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(output) {
-        if let Some(preview) = value.get("preview").and_then(Value::as_str) {
-            return truncate_tool_preview(preview, 6000);
-        }
-        if let Some(command_output) = value.get("output").and_then(Value::as_str) {
-            return truncate_tool_preview(command_output, 6000);
-        }
-        if value.as_object().is_some_and(|object| object.is_empty()) {
-            return String::new();
-        }
-        return truncate_tool_preview(&value.to_string(), 6000);
-    }
-    truncate_tool_preview(output, 6000)
-}
-
-fn truncate_tool_preview(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let mut end = 0;
-    for (idx, _) in text.char_indices() {
-        if idx > limit {
-            break;
-        }
-        end = idx;
-    }
-    format!(
-        "{}\n... [truncated {} chars]",
-        &text[..end],
-        text.len().saturating_sub(end)
-    )
-}
-
-fn escape_fence(text: &str) -> String {
-    text.replace("```", "'''")
-}
-
-/// Extract the last `max_lines` lines of the stdout section from run_command_tool output.
-fn extract_stdout_tail(output: &str, max_lines: usize) -> String {
-    // Format: "$ cmd\n\nexit_code: N\n\nstdout:\n{content}\n\nstderr:\n..."
-    let stdout_start = match output.find("\nstdout:\n") {
-        Some(pos) => pos + "\nstdout:\n".len(),
-        None => return String::new(),
-    };
-    let stdout_end = output[stdout_start..]
-        .find("\n\nstderr:")
-        .map(|pos| stdout_start + pos)
-        .unwrap_or(output.len());
-    let stdout = output[stdout_start..stdout_end].trim();
-    if stdout.is_empty() {
-        return String::new();
-    }
-    let lines: Vec<&str> = stdout.lines().collect();
-    if lines.len() <= max_lines {
-        stdout.to_owned()
-    } else {
-        let skipped = lines.len() - max_lines;
-        format!(
-            "[... {} lines omitted ...]\n{}",
-            skipped,
-            lines[skipped..].join("\n")
-        )
-    }
-}
-
-fn extract_stderr_tail(output: &str, max_lines: usize) -> String {
-    let stderr_start = match output.find("\nstderr:\n") {
-        Some(pos) => pos + "\nstderr:\n".len(),
-        None => return String::new(),
-    };
-    tail_lines(output[stderr_start..].trim(), max_lines)
-}
-
-fn extract_command_tail(output: &str, max_lines: usize) -> String {
-    let stdout = extract_stdout_tail(output, max_lines);
-    let stderr = extract_stderr_tail(output, max_lines);
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => format!("stdout:\n{stdout}"),
-        (true, false) => format!("stderr:\n{stderr}"),
-        (false, false) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
-    }
-}
-
-fn tail_lines(text: &str, max_lines: usize) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= max_lines {
-        return text.to_owned();
-    }
-    let skipped = lines.len() - max_lines;
-    format!(
-        "[... {} lines omitted ...]\n{}",
-        skipped,
-        lines[skipped..].join("\n")
-    )
-}
-
-fn extract_exit_code(output: &str) -> String {
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("exit_code: ") {
-            return rest.trim().to_owned();
-        }
-    }
-    "unknown".to_owned()
-}
-
-fn extract_result_line_field(output: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}: ");
-    output.lines().find_map(|line| {
-        line.strip_prefix(&prefix)
-            .map(|value| value.trim().to_owned())
-    })
+fn render_tool_error(_name: &str, _args: &Map<String, Value>, error: &str) -> String {
+    error.to_owned()
 }
 
 fn parse_tool_output(output: &str) -> Value {
@@ -2289,43 +2033,31 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_finished_reports_file_editing_tools() {
+    fn render_tool_finished_returns_raw_output() {
         let args = json!({"path": "notes.txt"}).as_object().cloned().unwrap();
         assert_eq!(
-            render_tool_finished("edit_file_tool", &args, "{}"),
-            Some("Updated `notes.txt`.".to_owned())
+            render_tool_finished("edit_file_tool", &args, "raw edit output"),
+            Some("raw edit output".to_owned())
         );
         assert_eq!(
-            render_tool_finished("patch_file_tool", &args, "{}"),
-            Some("Patched `notes.txt`.".to_owned())
+            render_tool_finished("patch_file_tool", &args, "raw patch output"),
+            Some("raw patch output".to_owned())
         );
         assert_eq!(
-            render_tool_finished(
-                "create_artifact_tool",
-                &json!({}).as_object().cloned().unwrap(),
-                "{}"
-            ),
-            Some("Created file.".to_owned())
-        );
-        assert_eq!(
-            render_tool_finished("delete_path_tool", &args, "{}"),
-            Some("Deleted `notes.txt`.".to_owned())
+            render_tool_finished("delete_path_tool", &args, "raw delete output"),
+            Some("raw delete output".to_owned())
         );
     }
 
     #[test]
-    fn render_tool_finished_reports_running_run_command_sessions() {
+    fn render_tool_finished_returns_raw_command_output() {
         let args = json!({"cmd": "tail -f log.txt"})
             .as_object()
             .cloned()
             .unwrap();
         let output = "$ tail -f log.txt\n\nsession_id: cmdsess_abc123\n\nrunning: true\n\nstdout:\nready\n\nstderr:\n\n[command is still running in session `cmdsess_abc123`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]";
         let rendered = render_tool_finished("run_command_tool", &args, output).expect("rendered");
-        assert!(
-            rendered.contains("`tail -f log.txt` is still running in session `cmdsess_abc123`.")
-        );
-        assert!(rendered.contains("stdout:"));
-        assert!(rendered.contains("ready"));
+        assert_eq!(rendered, output);
     }
 
     #[test]
@@ -2533,7 +2265,7 @@ mod tests {
         let update_text = update["params"]["update"]["content"][0]["content"]["text"]
             .as_str()
             .expect("update text");
-        assert!(update_text.contains("Created `summary.md`."));
+        assert!(update_text.contains(r#""filename":"summary.md""#));
         assert!(update_text.contains("# Summary"));
     }
 
@@ -2598,9 +2330,64 @@ mod tests {
         let finished_text = finished["params"]["update"]["content"][0]["content"]["text"]
             .as_str()
             .expect("finished text");
-        assert!(finished_text.contains("Patched `notes.txt`."));
+        assert!(finished_text.contains(r#""status":"patched""#));
         assert!(finished_text.contains("--- old"));
         assert!(finished_text.contains("+++ new"));
+    }
+
+    #[tokio::test]
+    async fn progress_registry_reports_display_error_in_tool_panel() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (caller_tx, _caller_rx) = mpsc::unbounded_channel();
+        let progress_registry = ProgressRegistry {
+            inner: BuiltinToolRegistry::new(tempdir.path()).expect("registry"),
+            tx,
+            session_id: "sess_test".to_owned(),
+            counter: Arc::new(AtomicU64::new(0)),
+            caller: ClientCaller::new(caller_tx),
+            has_terminal: false,
+            active_reasoning: Arc::new(std::sync::Mutex::new(None)),
+            terminal_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+
+        let err = progress_registry
+            .invoke(
+                "list_dir_tool",
+                json!({"path": "tools"}).as_object().cloned().unwrap(),
+            )
+            .await
+            .expect_err("missing directory should fail");
+        let err_text = err.to_string();
+        assert!(err_text.contains("failed to list"));
+        assert!(err_text.contains("No such file") || err_text.contains("os error"));
+
+        let updates = drain_updates(&mut rx);
+        let finished = updates
+            .iter()
+            .filter(|msg| {
+                msg.get("params")
+                    .and_then(|v| v.get("update"))
+                    .and_then(|v| v.get("sessionUpdate"))
+                    .and_then(|v| v.as_str())
+                    == Some("tool_call_update")
+            })
+            .last()
+            .expect("tool_call_update");
+
+        assert_eq!(
+            finished["params"]["update"]["status"],
+            Value::String("error".to_owned())
+        );
+        let finished_text = finished["params"]["update"]["content"][0]["content"]["text"]
+            .as_str()
+            .expect("finished text");
+        assert!(finished_text.contains("failed to list"));
+        assert!(finished_text.contains("No such file") || finished_text.contains("os error"));
+        assert_eq!(
+            finished["params"]["update"]["rawOutput"],
+            Value::String(err_text)
+        );
     }
 
     #[tokio::test]
