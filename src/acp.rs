@@ -1290,7 +1290,9 @@ impl ProgressRegistry {
         .await
         {
             Ok(inner) => inner,
-            Err(_) => Err(anyhow::anyhow!("terminal/wait_for_exit timed out after 300s")),
+            Err(_) => Err(anyhow::anyhow!(
+                "terminal/wait_for_exit timed out after 300s"
+            )),
         };
 
         let output_result = self
@@ -1307,11 +1309,17 @@ impl ProgressRegistry {
         let exit_payload = exit_result.ok();
         let output_payload = output_result.ok();
 
-        let exit_code = exit_payload.as_ref().and_then(extract_terminal_exit_code)
-            .or_else(|| output_payload.as_ref().and_then(|v| {
-                v.get("exitStatus").and_then(|s| s.get("exitCode")).and_then(|c| c.as_i64())
-                .or_else(|| v.get("exitCode").and_then(|c| c.as_i64()))
-            }));
+        let exit_code = exit_payload
+            .as_ref()
+            .and_then(extract_terminal_exit_code)
+            .or_else(|| {
+                output_payload.as_ref().and_then(|v| {
+                    v.get("exitStatus")
+                        .and_then(|s| s.get("exitCode"))
+                        .and_then(|c| c.as_i64())
+                        .or_else(|| v.get("exitCode").and_then(|c| c.as_i64()))
+                })
+            });
         let output = output_payload
             .as_ref()
             .map(extract_terminal_output)
@@ -1397,18 +1405,13 @@ impl ToolExecutor for ProgressRegistry {
 
         // ACP tool_call event
         let kind = tool_kind(name);
-        let primary = primary_value(&arguments);
-        let title = if primary.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{name}: {primary}")
-        };
+        let title = render_tool_title(name, &arguments);
 
-        // Use active reasoning as the initial content if available.
-        let initial_text = {
-            let mut lock = self.active_reasoning.lock().unwrap();
-            lock.take().unwrap_or_else(|| "Starting".to_owned())
-        };
+        // Keep model reasoning in the thought stream, not inside the expandable
+        // tool-call panel. Tool panels should describe the tool action itself.
+        self.active_reasoning.lock().unwrap().take();
+        let initial_text =
+            render_tool_started(name, &arguments).unwrap_or_else(|| "Starting.".to_owned());
 
         let mut start_update = json!({
             "sessionUpdate": "tool_call",
@@ -1442,28 +1445,29 @@ impl ToolExecutor for ProgressRegistry {
             return self.invoke_via_terminal(tool_call_id, &arguments).await;
         }
         if name == "start_command_session_tool" && self.has_terminal {
-            return self.invoke_start_session_with_terminal(tool_call_id, &arguments).await;
+            return self
+                .invoke_start_session_with_terminal(tool_call_id, &arguments)
+                .await;
         }
 
         // Route read/terminate through terminal/output or terminal/kill when the
         // session_id refers to a terminal-backed session (termsess_* prefix).
-        let terminal_id_for_session = if name == "read_command_session_tool"
-            || name == "terminate_command_session_tool"
-        {
-            arguments
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .and_then(|sid| {
-                    self.terminal_sessions
-                        .lock()
-                        .unwrap()
-                        .get(sid)
-                        .cloned()
-                        .map(|tid| (sid.to_owned(), tid))
-                })
-        } else {
-            None
-        };
+        let terminal_id_for_session =
+            if name == "read_command_session_tool" || name == "terminate_command_session_tool" {
+                arguments
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|sid| {
+                        self.terminal_sessions
+                            .lock()
+                            .unwrap()
+                            .get(sid)
+                            .cloned()
+                            .map(|tid| (sid.to_owned(), tid))
+                    })
+            } else {
+                None
+            };
 
         let result = if let Some((sid, tid)) = terminal_id_for_session {
             if name == "read_command_session_tool" {
@@ -1482,10 +1486,11 @@ impl ToolExecutor for ProgressRegistry {
                     .unwrap_or_else(|| "Completed.".to_owned());
                 (update_text, Some(parse_tool_output(output)), false)
             }
-            Err(e) => {
-                self.send_thought_raw(&format!("Error: {e}"));
-                (format!("Error: {e}"), Some(Value::String(e.to_string())), true)
-            }
+            Err(e) => (
+                render_tool_error(name, &arguments, &format!("{e:?}")),
+                Some(Value::String(format!("{e:?}"))),
+                true,
+            ),
         };
 
         let status = if is_error { "error" } else { "completed" };
@@ -1748,15 +1753,57 @@ fn tool_kind(name: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-fn primary_value(args: &Map<String, Value>) -> String {
-    for key in &["path", "query", "url", "cmd", "filename", "session_id"] {
-        if let Some(v) = args.get(*key).and_then(|v| v.as_str()) {
-            if !v.is_empty() {
-                return v.to_owned();
-            }
+fn render_tool_title(name: &str, args: &Map<String, Value>) -> String {
+    let path = str_arg(args, "path");
+    let query = str_arg(args, "query");
+    let url = str_arg(args, "url");
+    let cmd = str_arg(args, "cmd");
+    let session_id = str_arg(args, "session_id");
+    let filename = str_arg(args, "filename");
+
+    match name {
+        "read_file_tool" => format!("Read {}", display_value(&path, ".")),
+        "list_dir_tool" => format!("List {}", display_value(&path, ".")),
+        "search_code_tool" => format!("Search {}", display_value(&query, "<empty>")),
+        "web_search_tool" => format!("Search web {}", display_value(&query, "<empty>")),
+        "web_fetch_tool" => format!("Fetch {}", display_value(&url, "<empty>")),
+        "run_command_tool" => format!("Run {}", display_value(&cmd, "<empty>")),
+        "list_command_sessions_tool" => "List command sessions".to_owned(),
+        "start_command_session_tool" => {
+            format!("Start command session {}", display_value(&cmd, "<empty>"))
         }
+        "read_command_session_tool" => {
+            format!(
+                "Read command session {}",
+                display_value(&session_id, "<empty>")
+            )
+        }
+        "write_command_session_tool" => {
+            format!(
+                "Write command session {}",
+                display_value(&session_id, "<empty>")
+            )
+        }
+        "terminate_command_session_tool" => {
+            format!(
+                "Terminate command session {}",
+                display_value(&session_id, "<empty>")
+            )
+        }
+        "edit_file_tool" => format!("Edit {}", display_value(&path, "<empty>")),
+        "patch_file_tool" => format!("Patch {}", display_value(&path, "<empty>")),
+        "delete_path_tool" => format!("Delete {}", display_value(&path, "<empty>")),
+        "create_artifact_tool" => format!("Create {}", display_value(&filename, "<auto>")),
+        _ => name.to_owned(),
     }
-    String::new()
+}
+
+fn display_value(value: &str, fallback: &str) -> String {
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        value.to_owned()
+    }
 }
 
 fn str_arg(args: &Map<String, Value>, key: &str) -> String {
@@ -1788,7 +1835,8 @@ fn render_tool_started(name: &str, args: &Map<String, Value>) -> Option<String> 
         "terminate_command_session_tool" => {
             format!("Terminating terminal session `{session_id}`.")
         }
-        "edit_file_tool" | "patch_file_tool" => format!("Editing `{path}`."),
+        "edit_file_tool" => format!("Editing `{path}`."),
+        "patch_file_tool" => format!("Patching `{path}`."),
         "delete_path_tool" => format!("Deleting `{path}`."),
         "create_artifact_tool" => {
             let fname = if filename.is_empty() {
@@ -1810,37 +1858,51 @@ fn render_tool_finished(name: &str, args: &Map<String, Value>, output: &str) -> 
     let session_id = str_arg(args, "session_id");
 
     Some(match name {
-        "read_file_tool" => format!("Loaded `{path}`."),
-        "list_dir_tool" => format!("Listed `{}`.", if path.is_empty() { "." } else { &path }),
+        "read_file_tool" => append_tool_output(format!("Read `{path}`."), output, "text"),
+        "list_dir_tool" => append_tool_output(
+            format!("Listed `{}`.", if path.is_empty() { "." } else { &path }),
+            output,
+            "text",
+        ),
         "search_code_tool" => {
             let matches = output.lines().count();
-            format!("Found {matches} lines for `{query}`.")
+            append_tool_output(
+                format!("Found {matches} lines for `{query}`."),
+                output,
+                "text",
+            )
         }
-        "web_search_tool" => format!("Searched the web for `{query}`."),
+        "web_search_tool" => {
+            append_tool_output(format!("Searched the web for `{query}`."), output, "text")
+        }
         "web_fetch_tool" => {
             let chars = output.len();
-            format!("Fetched `{url}` ({chars} chars).")
+            append_tool_output(format!("Fetched `{url}` ({chars} chars)."), output, "text")
         }
         "run_command_tool" => {
             if let Some(session_id) = extract_result_line_field(output, "session_id") {
                 if extract_result_line_field(output, "running").as_deref() == Some("true") {
-                    format!("`{cmd}` is still running in session `{session_id}`.")
+                    append_tool_output(
+                        format!("`{cmd}` is still running in session `{session_id}`."),
+                        output,
+                        "text",
+                    )
                 } else {
                     let exit = extract_exit_code(output);
-                    let stdout = extract_stdout_tail(output, 30);
-                    if stdout.is_empty() {
+                    let command_output = extract_command_tail(output, 30);
+                    if command_output.is_empty() {
                         format!("`{cmd}` exited with code {exit}.")
                     } else {
-                        format!("`{cmd}` exited with code {exit}.\n```\n{stdout}\n```")
+                        format!("`{cmd}` exited with code {exit}.\n```text\n{command_output}\n```")
                     }
                 }
             } else {
                 let exit = extract_exit_code(output);
-                let stdout = extract_stdout_tail(output, 30);
-                if stdout.is_empty() {
+                let command_output = extract_command_tail(output, 30);
+                if command_output.is_empty() {
                     format!("`{cmd}` exited with code {exit}.")
                 } else {
-                    format!("`{cmd}` exited with code {exit}.\n```\n{stdout}\n```")
+                    format!("`{cmd}` exited with code {exit}.\n```text\n{command_output}\n```")
                 }
             }
         }
@@ -1849,7 +1911,7 @@ fn render_tool_finished(name: &str, args: &Map<String, Value>, output: &str) -> 
                 .ok()
                 .and_then(|v| v.as_array().map(|items| items.len()))
                 .unwrap_or(0);
-            format!("Listed {count} terminal sessions.")
+            append_tool_output(format!("Listed {count} terminal sessions."), output, "json")
         }
         "start_command_session_tool" => {
             // result is JSON with session_id
@@ -1861,21 +1923,33 @@ fn render_tool_finished(name: &str, args: &Map<String, Value>, output: &str) -> 
                         .map(str::to_owned)
                 })
                 .unwrap_or_default();
-            format!("Started terminal session `{sid}` for `{cmd}`.")
+            append_tool_output(
+                format!("Started terminal session `{sid}` for `{cmd}`."),
+                output,
+                "json",
+            )
         }
         "read_command_session_tool" => {
             let chars = serde_json::from_str::<Value>(output)
                 .ok()
                 .and_then(|v| v.get("output").and_then(|v| v.as_str()).map(|s| s.len()))
                 .unwrap_or(0);
-            format!("Read {chars} chars from `{session_id}`.")
+            append_tool_output(
+                format!("Read {chars} chars from `{session_id}`."),
+                output,
+                "text",
+            )
         }
         "write_command_session_tool" => {
             let chars = serde_json::from_str::<Value>(output)
                 .ok()
                 .and_then(|v| v.get("written_chars").and_then(|v| v.as_u64()))
                 .unwrap_or(0);
-            format!("Wrote {chars} chars to `{session_id}`.")
+            append_tool_output(
+                format!("Wrote {chars} chars to `{session_id}`."),
+                output,
+                "json",
+            )
         }
         "terminate_command_session_tool" => {
             let exit = serde_json::from_str::<Value>(output)
@@ -1883,12 +1957,84 @@ fn render_tool_finished(name: &str, args: &Map<String, Value>, output: &str) -> 
                 .and_then(|v| v.get("exit_code").and_then(|v| v.as_i64()))
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "unknown".to_owned());
-            format!("Terminated `{session_id}` (exit {exit}).")
+            append_tool_output(
+                format!("Terminated `{session_id}` (exit {exit})."),
+                output,
+                "json",
+            )
         }
-        "delete_path_tool" => format!("Deleted `{path}`."),
-        "create_artifact_tool" | "edit_file_tool" | "patch_file_tool" => return None,
+        "delete_path_tool" => append_tool_output(format!("Deleted `{path}`."), output, "json"),
+        "create_artifact_tool" => {
+            let filename = serde_json::from_str::<Value>(output)
+                .ok()
+                .and_then(|v| {
+                    v.get("filename")
+                        .or_else(|| v.get("path"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| str_arg(args, "filename"));
+            if filename.is_empty() {
+                append_tool_output("Created file.".to_owned(), output, "text")
+            } else {
+                append_tool_output(format!("Created `{filename}`."), output, "text")
+            }
+        }
+        "edit_file_tool" => append_tool_output(format!("Updated `{path}`."), output, "text"),
+        "patch_file_tool" => append_tool_output(format!("Patched `{path}`."), output, "diff"),
         _ => return None,
     })
+}
+
+fn render_tool_error(name: &str, args: &Map<String, Value>, error: &str) -> String {
+    let summary = format!("{} failed.", render_tool_title(name, args));
+    append_tool_output(summary, error, "text")
+}
+
+fn append_tool_output(summary: String, output: &str, language: &str) -> String {
+    let preview = tool_output_preview(output);
+    if preview.trim().is_empty() {
+        return summary;
+    }
+    format!("{summary}\n```{language}\n{}\n```", escape_fence(&preview))
+}
+
+fn tool_output_preview(output: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(output) {
+        if let Some(preview) = value.get("preview").and_then(Value::as_str) {
+            return truncate_tool_preview(preview, 6000);
+        }
+        if let Some(command_output) = value.get("output").and_then(Value::as_str) {
+            return truncate_tool_preview(command_output, 6000);
+        }
+        if value.as_object().is_some_and(|object| object.is_empty()) {
+            return String::new();
+        }
+        return truncate_tool_preview(&value.to_string(), 6000);
+    }
+    truncate_tool_preview(output, 6000)
+}
+
+fn truncate_tool_preview(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = 0;
+    for (idx, _) in text.char_indices() {
+        if idx > limit {
+            break;
+        }
+        end = idx;
+    }
+    format!(
+        "{}\n... [truncated {} chars]",
+        &text[..end],
+        text.len().saturating_sub(end)
+    )
+}
+
+fn escape_fence(text: &str) -> String {
+    text.replace("```", "'''")
 }
 
 /// Extract the last `max_lines` lines of the stdout section from run_command_tool output.
@@ -1917,6 +2063,41 @@ fn extract_stdout_tail(output: &str, max_lines: usize) -> String {
             lines[skipped..].join("\n")
         )
     }
+}
+
+fn extract_stderr_tail(output: &str, max_lines: usize) -> String {
+    let stderr_start = match output.find("\nstderr:\n") {
+        Some(pos) => pos + "\nstderr:\n".len(),
+        None => return String::new(),
+    };
+    tail_lines(output[stderr_start..].trim(), max_lines)
+}
+
+fn extract_command_tail(output: &str, max_lines: usize) -> String {
+    let stdout = extract_stdout_tail(output, max_lines);
+    let stderr = extract_stderr_tail(output, max_lines);
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("stdout:\n{stdout}"),
+        (true, false) => format!("stderr:\n{stderr}"),
+        (false, false) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
+    }
+}
+
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_lines {
+        return text.to_owned();
+    }
+    let skipped = lines.len() - max_lines;
+    format!(
+        "[... {} lines omitted ...]\n{}",
+        skipped,
+        lines[skipped..].join("\n")
+    )
 }
 
 fn extract_exit_code(output: &str) -> String {
@@ -2019,9 +2200,9 @@ fn extract_terminal_output(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::collections::VecDeque;
     use std::fs as stdfs;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
@@ -2108,17 +2289,23 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_finished_omits_generic_messages_for_editing_tools() {
+    fn render_tool_finished_reports_file_editing_tools() {
         let args = json!({"path": "notes.txt"}).as_object().cloned().unwrap();
-        assert_eq!(render_tool_finished("edit_file_tool", &args, "{}"), None);
-        assert_eq!(render_tool_finished("patch_file_tool", &args, "{}"), None);
+        assert_eq!(
+            render_tool_finished("edit_file_tool", &args, "{}"),
+            Some("Updated `notes.txt`.".to_owned())
+        );
+        assert_eq!(
+            render_tool_finished("patch_file_tool", &args, "{}"),
+            Some("Patched `notes.txt`.".to_owned())
+        );
         assert_eq!(
             render_tool_finished(
                 "create_artifact_tool",
                 &json!({}).as_object().cloned().unwrap(),
                 "{}"
             ),
-            None
+            Some("Created file.".to_owned())
         );
         assert_eq!(
             render_tool_finished("delete_path_tool", &args, "{}"),
@@ -2133,10 +2320,12 @@ mod tests {
             .cloned()
             .unwrap();
         let output = "$ tail -f log.txt\n\nsession_id: cmdsess_abc123\n\nrunning: true\n\nstdout:\nready\n\nstderr:\n\n[command is still running in session `cmdsess_abc123`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]";
-        assert_eq!(
-            render_tool_finished("run_command_tool", &args, output),
-            Some("`tail -f log.txt` is still running in session `cmdsess_abc123`.".to_owned())
+        let rendered = render_tool_finished("run_command_tool", &args, output).expect("rendered");
+        assert!(
+            rendered.contains("`tail -f log.txt` is still running in session `cmdsess_abc123`.")
         );
+        assert!(rendered.contains("stdout:"));
+        assert!(rendered.contains("ready"));
     }
 
     #[test]
@@ -2273,7 +2462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_registry_emits_create_artifact_reasoning_and_raw_output() {
+    async fn progress_registry_emits_create_artifact_reasoning_and_tool_output() {
         let tempdir = TempDir::new().expect("tempdir");
         let model = Arc::new(MockModel::new(vec![
             "markdown",
@@ -2341,10 +2530,77 @@ mod tests {
             update["params"]["update"]["rawOutput"]["filename"],
             Value::String("summary.md".to_owned())
         );
+        let update_text = update["params"]["update"]["content"][0]["content"]["text"]
+            .as_str()
+            .expect("update text");
+        assert!(update_text.contains("Created `summary.md`."));
+        assert!(update_text.contains("# Summary"));
+    }
+
+    #[tokio::test]
+    async fn progress_registry_keeps_reasoning_out_of_tool_call_content() {
+        let tempdir = TempDir::new().expect("tempdir");
+        stdfs::write(tempdir.path().join("notes.txt"), "old").expect("write notes");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (caller_tx, _caller_rx) = mpsc::unbounded_channel();
+        let active_reasoning = Arc::new(std::sync::Mutex::new(Some(
+            "I should patch the file now.".to_owned(),
+        )));
+        let progress_registry = ProgressRegistry {
+            inner: BuiltinToolRegistry::new(tempdir.path()).expect("registry"),
+            tx,
+            session_id: "sess_test".to_owned(),
+            counter: Arc::new(AtomicU64::new(0)),
+            caller: ClientCaller::new(caller_tx),
+            has_terminal: false,
+            active_reasoning,
+            terminal_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+
+        progress_registry
+            .invoke(
+                "patch_file_tool",
+                json!({"path": "notes.txt", "old_text": "old", "new_text": "new"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            )
+            .await
+            .expect("invoke");
+
+        let updates = drain_updates(&mut rx);
+        let tool_call = updates
+            .iter()
+            .find(|msg| {
+                msg.get("params")
+                    .and_then(|v| v.get("update"))
+                    .and_then(|v| v.get("sessionUpdate"))
+                    .and_then(|v| v.as_str())
+                    == Some("tool_call")
+            })
+            .expect("tool_call");
         assert_eq!(
-            update["params"]["update"]["content"][0]["content"]["text"],
-            Value::String("Completed.".to_owned())
+            tool_call["params"]["update"]["content"][0]["content"]["text"],
+            Value::String("Patching `notes.txt`.".to_owned())
         );
+
+        let finished = updates
+            .iter()
+            .filter(|msg| {
+                msg.get("params")
+                    .and_then(|v| v.get("update"))
+                    .and_then(|v| v.get("sessionUpdate"))
+                    .and_then(|v| v.as_str())
+                    == Some("tool_call_update")
+            })
+            .last()
+            .expect("tool_call_update");
+        let finished_text = finished["params"]["update"]["content"][0]["content"]["text"]
+            .as_str()
+            .expect("finished text");
+        assert!(finished_text.contains("Patched `notes.txt`."));
+        assert!(finished_text.contains("--- old"));
+        assert!(finished_text.contains("+++ new"));
     }
 
     #[tokio::test]

@@ -14,7 +14,6 @@ pub mod command;
 pub mod fs;
 pub mod web;
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolProgressEvent {
     Reasoning { summary: String },
@@ -101,7 +100,7 @@ impl BuiltinToolRegistry {
                         "properties": {
                             "path": {"type": "string", "description": "Path to the file, relative to the workspace root."},
                             "start_line": {"type": "integer", "description": "1-based line number to start reading from (default 1)."},
-                            "limit": {"type": "integer", "description": "Max number of lines to return (default 100)."}
+                            "limit": {"type": "integer", "description": "Max number of lines to return (default 200)."}
                         },
                         "required": ["path"]
                     }
@@ -284,7 +283,7 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "edit_file_tool",
-                    "description": "Modify an existing file in the workspace.\n\nUse this whenever the user asks to edit, modify, rewrite, improve, update, or refactor an existing file.",
+                    "description": "Rewrite an entire small existing file in the workspace.\n\nDo not use this for targeted edits, appends, refactors inside large files, or changes where exact old/new text can be identified. Prefer patch_file_tool for those cases.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -299,7 +298,7 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "create_artifact_tool",
-                    "description": "Create and write a new file in the workspace.\n\nUse this whenever the user asks to create, make, write, save, or generate a file, note, document, config, or code artifact.\nDo not answer with the file contents directly when this tool should be used.",
+                    "description": "Create and write a new file in the workspace.\n\nUse this whenever the user asks to create, make, write, save, or generate a file, note, document, config, or code artifact.\nIf the user names an exact filename, pass that filename.\nDo not answer with the file contents directly when this tool should be used.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -330,7 +329,7 @@ impl BuiltinToolRegistry {
             .get("limit")
             .and_then(Value::as_u64)
             .map(|v| v as usize)
-            .unwrap_or(100);
+            .unwrap_or(200);
         let content = fs::read_file(&self.workspace_cwd, path)?;
         Ok(file_chunk_lines(&content, start_line, limit))
     }
@@ -363,7 +362,10 @@ impl BuiltinToolRegistry {
 
     fn invoke_run_command(&self, arguments: Map<String, Value>) -> Result<String> {
         let cmd = required_string(&arguments, "cmd")?;
-        command::run_command(&self.cmd_sessions, &self.workspace_cwd, cmd)
+        command::run_command(&self.cmd_sessions, &self.workspace_cwd, cmd).map_err(|error| {
+            eprintln!("[run_command_tool] command failed: cmd={cmd:?}, error={error:?}");
+            error
+        })
     }
 
     fn invoke_start_command_session(&self, arguments: Map<String, Value>) -> Result<String> {
@@ -422,7 +424,8 @@ impl BuiltinToolRegistry {
         Ok(json!({
             "status": "patched",
             "path": written,
-            "replace_all": replace_all
+            "replace_all": replace_all,
+            "preview": patch_preview(old_text, new_text)
         })
         .to_string())
     }
@@ -449,11 +452,12 @@ impl BuiltinToolRegistry {
         let model = self.require_model()?;
 
         let original = fs::read_file(&self.workspace_cwd, path)?;
+        let original_len = original.len();
         let messages = [
             ChatMessage::system(concat!(
                 "You are editing a file.\n",
                 "Return only the full updated file contents.\n",
-                "Preserve unrelated content.\n",
+                "Preserve ALL unrelated content exactly as-is — do not summarise, omit, or truncate any part of the file.\n",
                 "Do not explain changes.\n",
                 "Do not use code fences."
             )),
@@ -463,17 +467,35 @@ impl BuiltinToolRegistry {
         ];
         let rewritten = sanitize_generated_file_content(
             &model
-                .complete(&messages, &[], 2200, 0.0, None)
+                .complete(&messages, &[], 2500, 0.0, None)
                 .await?
                 .content
                 .unwrap_or_default(),
         );
+
+        // Guard against truncated output: if the model returned less than 60% of
+        // the original length, the rewrite is almost certainly incomplete.
+        if original_len > 200 && rewritten.len() < original_len * 6 / 10 {
+            anyhow::bail!(
+                "edit_file_tool: model output ({} chars) is too short compared to the original \
+                 file ({} chars) — refusing to write a likely-truncated result. \
+                 Use patch_file_tool to make targeted edits to large files.",
+                rewritten.len(),
+                original_len
+            );
+        }
+
         let written = fs::write_file(&self.workspace_cwd, path, &rewritten)?;
         self.emit_progress(ToolProgressEvent::FileModified {
             path: written.clone(),
             status: "updated".to_owned(),
         });
-        Ok(json!({"status": "updated", "path": written}).to_string())
+        Ok(json!({
+            "status": "updated",
+            "path": written,
+            "preview": file_preview(&rewritten)
+        })
+        .to_string())
     }
 
     async fn invoke_create_artifact(&self, arguments: Map<String, Value>) -> Result<String> {
@@ -493,6 +515,8 @@ impl BuiltinToolRegistry {
         };
         let final_name = if let Some(f) = filename {
             f.to_owned()
+        } else if let Some(f) = exact_filename_from_instruction(instruction) {
+            f
         } else {
             infer_filename(model, instruction, &resolved_kind).await?
         };
@@ -518,7 +542,13 @@ impl BuiltinToolRegistry {
             path: written.clone(),
             status: "created".to_owned(),
         });
-        Ok(json!({"status": "created", "filename": final_name, "path": written}).to_string())
+        Ok(json!({
+            "status": "created",
+            "filename": final_name,
+            "path": written,
+            "preview": file_preview(&content)
+        })
+        .to_string())
     }
 }
 
@@ -708,6 +738,15 @@ async fn infer_filename(model: &dyn ModelClient, instruction: &str, kind: &str) 
     }
 }
 
+fn exact_filename_from_instruction(instruction: &str) -> Option<String> {
+    let re = Regex::new(
+        r"(?i)\b([A-Za-z0-9][A-Za-z0-9._-]*\.(?:md|txt|json|toml|ya?ml|rs|py|js|ts|tsx|jsx|dart|html|css))\b",
+    )
+    .unwrap();
+    let filename = re.captures(instruction)?.get(1)?.as_str();
+    Some(filename.trim_matches('`').to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -723,7 +762,7 @@ fn file_chunk_lines(content: &str, start_line: usize, limit: usize) -> String {
     let chunk = lines[from..to]
         .iter()
         .enumerate()
-        .map(|(i, line)| format!("{}: {line}", from + i + 1))
+        .map(|(i, line)| format_file_line(from + i + 1, line))
         .collect::<Vec<_>>()
         .join("\n");
     if to >= total {
@@ -740,6 +779,41 @@ fn file_chunk_lines(content: &str, start_line: usize, limit: usize) -> String {
     }
 }
 
+fn format_file_line(line_number: usize, line: &str) -> String {
+    format!("{line_number}: {line}")
+}
+
+fn file_preview(content: &str) -> String {
+    file_chunk_lines(content, 1, 80)
+}
+
+fn patch_preview(old_text: &str, new_text: &str) -> String {
+    format!(
+        "--- old\n{}\n+++ new\n{}",
+        preview_text(old_text),
+        preview_text(new_text)
+    )
+}
+
+fn preview_text(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 6000;
+    if text.len() <= MAX_PREVIEW_CHARS {
+        return text.to_owned();
+    }
+    let mut end = 0;
+    for (idx, _) in text.char_indices() {
+        if idx > MAX_PREVIEW_CHARS {
+            break;
+        }
+        end = idx;
+    }
+    format!(
+        "{}\n... [truncated {} chars]",
+        &text[..end],
+        text.len().saturating_sub(end)
+    )
+}
+
 fn required_string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
     arguments
         .get(key)
@@ -754,7 +828,6 @@ fn optional_string<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&
 fn optional_bool(arguments: &Map<String, Value>, key: &str) -> Option<bool> {
     arguments.get(key).and_then(Value::as_bool)
 }
-
 
 fn ceil_char_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
@@ -1218,6 +1291,33 @@ Body text.
         assert!(err.to_string().contains("model"));
     }
 
+    #[tokio::test]
+    async fn create_artifact_tool_uses_exact_filename_from_instruction() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let model = Arc::new(MockModel::new(vec![
+            "markdown",
+            "# Contributing\nRun `cargo test` before submitting.\n",
+        ]));
+        let registry =
+            BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
+
+        let result = registry
+            .invoke(
+                "create_artifact_tool",
+                json!({"instruction": "Add a CONTRIBUTING.md file at the repo root."})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            )
+            .await
+            .expect("invoke");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["status"], "created");
+        assert_eq!(parsed["filename"], "CONTRIBUTING.md");
+        assert!(tempdir.path().join("CONTRIBUTING.md").exists());
+    }
+
     // -----------------------------------------------------------------------
     // Existing integration tests
     // -----------------------------------------------------------------------
@@ -1373,33 +1473,55 @@ Body text.
     fn read_file_tool_paginates_large_content() {
         let tempdir = TempDir::new().expect("tempdir");
         let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
-        // 250 lines — more than the default 100-line limit.
-        let large = (1..=250).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        // 450 lines — more than the default 200-line limit.
+        let large = (1..=450)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         stdfs::write(tempdir.path().join("large.txt"), &large).expect("write large file");
 
-        // First read: default start_line=1, limit=100.
+        // First read: default start_line=1, limit=200.
         let page1 = futures::executor::block_on(registry.invoke(
             "read_file_tool",
             json!({"path": "large.txt"}).as_object().cloned().unwrap(),
         ))
         .expect("invoke page 1");
-        assert!(page1.contains("start_line=101 to continue"), "page 1 should show continuation: {page1}");
+        assert!(
+            page1.contains("start_line=201 to continue"),
+            "page 1 should show continuation: {page1}"
+        );
 
-        // Second read: start_line=101 gets lines 101-200.
-        let page2 = futures::executor::block_on(registry.invoke(
-            "read_file_tool",
-            json!({"path": "large.txt", "start_line": 101}).as_object().cloned().unwrap(),
-        ))
+        // Second read: start_line=201 gets lines 201-400.
+        let page2 = futures::executor::block_on(
+            registry.invoke(
+                "read_file_tool",
+                json!({"path": "large.txt", "start_line": 201})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
         .expect("invoke page 2");
-        assert!(page2.contains("start_line=201 to continue"), "page 2 should show continuation: {page2}");
+        assert!(
+            page2.contains("start_line=401 to continue"),
+            "page 2 should show continuation: {page2}"
+        );
 
-        // Third read: start_line=201 gets the rest.
-        let page3 = futures::executor::block_on(registry.invoke(
-            "read_file_tool",
-            json!({"path": "large.txt", "start_line": 201}).as_object().cloned().unwrap(),
-        ))
+        // Third read: start_line=401 gets the rest.
+        let page3 = futures::executor::block_on(
+            registry.invoke(
+                "read_file_tool",
+                json!({"path": "large.txt", "start_line": 401})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
         .expect("invoke page 3");
-        assert!(page3.contains("End of file"), "page 3 should reach end: {page3}");
+        assert!(
+            page3.contains("End of file"),
+            "page 3 should reach end: {page3}"
+        );
 
         // Small file: returned whole, no continuation notice.
         stdfs::write(tempdir.path().join("small.txt"), "hello").expect("write small file");
@@ -1409,5 +1531,26 @@ Body text.
         ))
         .expect("invoke small");
         assert_eq!(small, "1: hello");
+    }
+
+    #[test]
+    fn read_file_tool_reports_start_line_past_end() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        stdfs::write(tempdir.path().join("short.txt"), "one\ntwo\nthree\n")
+            .expect("write short file");
+
+        let output = futures::executor::block_on(
+            registry.invoke(
+                "read_file_tool",
+                json!({"path": "short.txt", "start_line": 99})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
+        .expect("invoke");
+
+        assert_eq!(output, "[start_line 99 is past end of file (3 lines)]");
     }
 }

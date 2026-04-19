@@ -20,22 +20,35 @@ Tools:
 - Call tools immediately. Do not narrate what you are about to do — just call the tool.
 - Call independent tools in parallel.
 - Max 3 read_file_tool calls per response. Batch reads; continue next turn if more are needed.
-- Prefer search_code_tool to locate symbols before reading whole files.
-- Stop calling tools once you have enough to answer accurately.
+- Never read the same file twice in one turn.
+- If the task names a specific file, function, or symbol: your first action must be search_code_tool — never list_dir_tool. Use list_dir_tool only when you genuinely need to discover what files exist in an unknown directory.
+- Search-anchor rule: use search_code_tool to locate a symbol. If the returned snippet answers the question, stop — do not open the file. If you need more context, read ONLY the relevant function: use the line number from the search result as start_line with a limit of 30-50 lines.
+- BANNED: reading a file at start_line: 1 after search_code_tool already returned a line number for that file. BANNED: reading a file in sequential 100-line pages (start_line: 1, 101, 201…). Both are top-to-bottom paging and waste turns. If you catch yourself about to do either, stop and use search_code_tool instead.
+- For explain-the-flow or trace-how-X-works tasks: search for specific function names (e.g. handle_session_prompt, run_agent_loop, persist_session), not broad keywords or module names. search_code_tool returns 3 lines of context around each match — if that is enough, answer directly. If not, read only that function using the returned line number as start_line.
+- Never answer implementation questions from CLAUDE.md, README, or comments alone. If the question is about how code works, search the actual source and read the relevant function before answering.
+- Use patch_file_tool for all targeted changes: adding lines, modifying values, appending code. Use edit_file_tool only when rewriting an entire file from scratch — keep the instruction one plain sentence, no quoted text inside it.
+- Never announce that you are about to make a change and then stop. Call the tool immediately or say you cannot do it.
+- Never claim to have made a change unless patch_file_tool or edit_file_tool returned successfully. If the last tool call was not one of those, no file was modified — do not say it was.
+- If the user asks a yes/no question, the agent should answer it directly before explaining.
+- Do not write meta labels like \"Self-Correction\", \"Refinement\", or similar process notes in thoughts or answers.
 
 Files:
+- Always use the exact file path returned by list_dir_tool or search_code_tool. Never construct a file path from memory — always get it from a tool first. If the user's message mentions a file path, verify it exists via search_code_tool before using it.
 - list_dir_tool → answer from names only unless user asked what each file does.
-- Use the exact path the user specifies.
-- For counts, use a precise rg/grep command.
+- For counts, use a precise rg/grep/wc command via run_command_tool.
 
 Commands:
 - Long-running tasks (cargo build, cargo test, npm install): use start_command_session_tool, then poll with read_command_session_tool until `running: false` or `exit_code` appears.
-- Never run build or test commands unless the user explicitly asks.
+- Never run build or test commands proactively. Exception: if you just modified source code, run cargo test once to verify the change compiles and tests pass.
+- Always confirm the exit code of a run_command_tool call before reporting success.
 
 Output:
 - When a task is done (command exited 0, file written, etc.): state what was done in one sentence and stop. Do not speculate about next steps.
-- Say \"I ran X\" — never \"the user ran X\".
 - If two different approaches both failed, stop and ask the user instead of trying a third.
+- If the task is ambiguous (no specific file, function, or error cited), ask one clarifying question before using any tool. This applies even if you find something relevant during search — do not act on it without confirming it is the intended target.
+- Ambiguous requests include phrases like \"something is slow\", \"make it smarter\", \"clean up the repo\", and \"fix the thing from last time\". Ask what the user means; do not search or edit.
+- Never cite a specific line number in your answer unless you have read that line with read_file_tool.
+- Use plain arrows like `->`; never use LaTeX arrows like `$\\rightarrow$`.
 - If you can't do something, say so.";
 
 // ---------------------------------------------------------------------------
@@ -198,8 +211,7 @@ pub async fn run_agent_loop(
     for iteration in 0..options.max_iterations {
         // When a thought handler is present, enable streaming so think tokens
         // arrive in real time (writing animation in the Zed panel).
-        let (think_tx, mut think_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
+        let (think_tx, mut think_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let maybe_tx = on_thought.is_some().then_some(think_tx);
 
         let result = {
@@ -263,6 +275,7 @@ pub async fn run_agent_loop(
             let answer = clean_text
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_default();
+            let answer = prevent_unsupported_completion_claims(answer, &all_tool_results);
 
             return Ok(LoopResult {
                 answer,
@@ -335,6 +348,109 @@ pub async fn run_agent_loop(
 /// than a genuine final answer. Qwen3.5-9B occasionally produces text like
 /// "cargo clean done, now I'll run cargo test" without calling the tool.
 /// Claude/GPT-4o do not exhibit this behavior.
+fn prevent_unsupported_completion_claims(answer: String, tool_results: &[ToolExecution]) -> String {
+    let lower = answer.to_lowercase();
+    let first_person_completion_claim = [
+        "i created",
+        "i added",
+        "i updated",
+        "i modified",
+        "i edited",
+        "i patched",
+        "i deleted",
+        "i wrote",
+        "i implemented",
+        "i applied",
+        "i have created",
+        "i have added",
+        "i have updated",
+        "i have modified",
+        "i have edited",
+        "i have patched",
+        "i have deleted",
+        "i have written",
+        "i have implemented",
+        "i have applied",
+        "i've created",
+        "i've added",
+        "i've updated",
+        "i've modified",
+        "i've edited",
+        "i've patched",
+        "i've deleted",
+        "i've written",
+        "i've implemented",
+        "i've applied",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+        || lower.starts_with("done")
+        || lower.starts_with("fixed")
+        || lower.starts_with("created")
+        || lower.starts_with("added")
+        || lower.starts_with("updated")
+        || lower.starts_with("patched")
+        || lower.starts_with("implemented");
+    let has_successful_tool = |names: &[&str]| {
+        tool_results
+            .iter()
+            .any(|tr| !tr.error && names.iter().any(|name| tr.name == *name))
+    };
+    let has_successful_command_result = || {
+        tool_results.iter().any(|tr| {
+            if tr.error {
+                return false;
+            }
+            if !matches!(
+                tr.name.as_str(),
+                "run_command_tool" | "read_command_session_tool"
+            ) {
+                return false;
+            }
+            tr.result.contains("exit_code: 0")
+                || tr.result.contains("\"exit_code\":0")
+                || tr.result.contains("\"exit_code\": 0")
+        })
+    };
+
+    let claims_file_change = [
+        "created",
+        "added",
+        "updated",
+        "modified",
+        "edited",
+        "patched",
+        "deleted",
+        "wrote",
+        "implemented",
+        "applied",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    let file_change_tools = [
+        "create_artifact_tool",
+        "edit_file_tool",
+        "patch_file_tool",
+        "delete_path_tool",
+    ];
+    if first_person_completion_claim
+        && claims_file_change
+        && !has_successful_tool(&file_change_tools)
+    {
+        return "I do not have a successful file-write tool result confirming that change."
+            .to_owned();
+    }
+
+    let claims_tests_passed = lower.contains("test")
+        && (lower.contains("passed") || lower.contains("pass") || lower.contains("cargo test"));
+    if claims_tests_passed && !has_successful_command_result() {
+        return "I do not have a successful command result confirming that tests passed."
+            .to_owned();
+    }
+
+    answer
+}
+
 // ---------------------------------------------------------------------------
 // Tool execution helpers
 // ---------------------------------------------------------------------------
@@ -654,6 +770,185 @@ mod tests {
         assert_eq!(tool_msg.tool_call_id.as_deref(), Some("abc123"));
     }
 
+    #[tokio::test]
+    async fn blocks_file_change_claims_without_write_tool_result() {
+        let model = MockModel::new(vec![text_response(
+            "I implemented the retry mechanism in src/agent_loop.rs.",
+        )]);
+        let tools = MockTools::with_outputs(HashMap::new());
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Make the agent smarter.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(
+            result.answer,
+            "I do not have a successful file-write tool result confirming that change."
+        );
+        assert!(result.tool_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn allows_explanations_that_mention_code_changes_without_claiming_action() {
+        let model = MockModel::new(vec![text_response(
+            "The flow updates SessionState, records commands, and persists the response.",
+        )]);
+        let tools = MockTools::with_outputs(HashMap::new());
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new(
+                "user",
+                "Explain the current ACP message flow.",
+            )],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(
+            result.answer,
+            "The flow updates SessionState, records commands, and persists the response."
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_done_style_file_change_claims_without_write_tool_result() {
+        let model = MockModel::new(vec![text_response("Updated README.md.")]);
+        let tools = MockTools::with_outputs(HashMap::new());
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Update README.md.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(
+            result.answer,
+            "I do not have a successful file-write tool result confirming that change."
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_file_change_claims_after_write_tool_result() {
+        let model = MockModel::new(vec![
+            tool_call_response(
+                "call_1",
+                "patch_file_tool",
+                json!({"path": "README.md", "old_text": "old", "new_text": "new"}),
+            ),
+            text_response("Patched README.md."),
+        ]);
+        let tools = MockTools::with_outputs(HashMap::from([(
+            "patch_file_tool".to_owned(),
+            Ok("{\"status\":\"patched\"}".to_owned()),
+        )]));
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Patch README.md.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(result.answer, "Patched README.md.");
+        assert_eq!(result.tool_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocks_test_pass_claims_without_command_result() {
+        let model = MockModel::new(vec![text_response("I ran cargo test, and tests passed.")]);
+        let tools = MockTools::with_outputs(HashMap::new());
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Change the code.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(
+            result.answer,
+            "I do not have a successful command result confirming that tests passed."
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_test_pass_claims_after_nonzero_command_result() {
+        let model = MockModel::new(vec![
+            tool_call_response("call_1", "run_command_tool", json!({"cmd": "cargo test"})),
+            text_response("I ran cargo test, and tests passed."),
+        ]);
+        let tools = MockTools::with_outputs(HashMap::from([(
+            "run_command_tool".to_owned(),
+            Ok("$ cargo test\n\nexit_code: 1\n\nstdout:\nfailed\n\nstderr:\n".to_owned()),
+        )]));
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Run tests.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(
+            result.answer,
+            "I do not have a successful command result confirming that tests passed."
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_test_pass_claims_after_zero_command_result() {
+        let model = MockModel::new(vec![
+            tool_call_response("call_1", "run_command_tool", json!({"cmd": "cargo test"})),
+            text_response("I ran cargo test, and tests passed."),
+        ]);
+        let tools = MockTools::with_outputs(HashMap::from([(
+            "run_command_tool".to_owned(),
+            Ok("$ cargo test\n\nexit_code: 0\n\nstdout:\nok\n\nstderr:\n".to_owned()),
+        )]));
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Run tests.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(result.answer, "I ran cargo test, and tests passed.");
+    }
+
     #[test]
     fn system_prompt_has_key_rules() {
         assert!(SYSTEM_PROMPT.contains("Max 3 read_file_tool calls per response"));
@@ -663,5 +958,7 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("one sentence"));
         assert!(SYSTEM_PROMPT.contains("start_command_session_tool"));
         assert!(SYSTEM_PROMPT.contains("read_command_session_tool"));
+        assert!(SYSTEM_PROMPT.contains("something is slow"));
+        assert!(SYSTEM_PROMPT.contains("fix the thing from last time"));
     }
 }

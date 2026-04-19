@@ -78,6 +78,8 @@ pub fn search_code(cwd: &Path, query: &str, glob: Option<&str>) -> Result<String
 
     let mut rg_args = vec![
         "-n".to_owned(),
+        "-C".to_owned(),
+        "3".to_owned(),
         "--hidden".to_owned(),
         "--glob".to_owned(),
         "!.git".to_owned(),
@@ -271,6 +273,20 @@ mod tests {
             list_dir(tempdir.path(), ".").expect("list dir"),
             vec!["a.txt".to_owned(), "src".to_owned()]
         );
+    }
+
+    #[test]
+    fn read_file_reports_actual_missing_path_error() {
+        let tempdir = TempDir::new().expect("tempdir");
+
+        let error = read_file(tempdir.path(), "tools/mod.rs").expect_err("missing file");
+
+        let debug = format!("{error:?}");
+        assert!(debug.contains("failed to read"));
+        assert!(debug.contains("tools/mod.rs"));
+        assert!(debug.contains("No such file") || debug.contains("os error"));
+        assert!(!debug.contains("search_code_tool"));
+        assert!(!debug.contains("list_dir_tool"));
     }
 
     #[test]

@@ -200,7 +200,10 @@ pub fn update_command_sessions(state: &mut SessionState, tool_results: &[ToolExe
 fn handle_session_start(state: &mut SessionState, tr: &ToolExecution) {
     let payload: Value = match serde_json::from_str(&tr.result) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            warn!("Failed to parse session read payload: {}", e);
+            return;
+        }
     };
     let sid = payload
         .get("session_id")
@@ -240,12 +243,13 @@ fn handle_run_command(state: &mut SessionState, tr: &ToolExecution) {
     }
 
     let cmd = string_arg(&tr.arguments, "cmd");
+    let combined_output = extract_command_output(&tr.result);
     state.active_command_sessions.insert(
         sid.clone(),
         CommandSessionInfo {
             session_id: sid,
             cmd,
-            last_output: extract_stdout_block(&tr.result),
+            last_output: combined_output,
             running: true,
             exit_code: None,
         },
@@ -259,7 +263,10 @@ fn handle_session_read(state: &mut SessionState, tr: &ToolExecution) {
     }
     let payload: Value = match serde_json::from_str(&tr.result) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            warn!("Failed to parse session read payload: {}", e);
+            return;
+        }
     };
     let output = payload
         .get("output")
@@ -315,7 +322,10 @@ fn json_field(text: &str, field: &str) -> String {
 fn extract_file_change(record: &mut TurnRecord, result: &str) {
     let payload: Value = match serde_json::from_str(result) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            warn!("Failed to parse session read payload: {}", e);
+            return;
+        }
     };
     let path = payload
         .get("path")
@@ -361,6 +371,35 @@ fn extract_stdout_block(result: &str) -> String {
         .map(|offset| start + offset)
         .unwrap_or(result.len());
     result[start..end].trim().to_owned()
+}
+
+fn extract_stderr_block(result: &str) -> String {
+    let Some(start) = result.find("\n\nstderr:\n") else {
+        return String::new();
+    };
+    let start = start + "\n\nstderr:\n".len();
+    let tail = &result[start..];
+    let end = [
+        "\n\n[command is still running",
+        "\n[command is still running",
+    ]
+    .iter()
+    .filter_map(|marker| tail.find(marker).map(|offset| start + offset))
+    .min()
+    .unwrap_or(result.len());
+    result[start..end].trim().to_owned()
+}
+
+fn extract_command_output(result: &str) -> String {
+    let stdout = extract_stdout_block(result);
+    let stderr = extract_stderr_block(result);
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => format!("stderr:\n{stderr}"),
+        (false, false) => format!("{stdout}\n\nstderr:\n{stderr}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +671,26 @@ mod tests {
         assert_eq!(info.cmd, "for i in 1 2 3; do echo tick; sleep 5; done");
         assert_eq!(info.last_output, "tick");
         assert!(info.running);
+    }
+
+    #[test]
+    fn run_command_session_output_keeps_stderr_for_debugging() {
+        let mut state = new_session("/tmp");
+        let running = tool_exec(
+            "run_command_tool",
+            json!({"cmd": "cargo test"}),
+            "$ cargo test\n\nsession_id: cmdsess_run123\n\nrunning: true\n\nstdout:\ncompiling\n\nstderr:\nwarning: failed to resolve cache\n\n[command is still running in session `cmdsess_run123`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]",
+        );
+
+        update_command_sessions(&mut state, &[running]);
+        let info = state
+            .active_command_sessions
+            .get("cmdsess_run123")
+            .expect("tracked session");
+        assert_eq!(
+            info.last_output,
+            "compiling\n\nstderr:\nwarning: failed to resolve cache"
+        );
     }
 
     // -----------------------------------------------------------------------

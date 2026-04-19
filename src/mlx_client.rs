@@ -287,21 +287,14 @@ impl MlxClient {
                     if let Some(content) = delta["content"].as_str() {
                         if !content.is_empty() {
                             full_text.push_str(content);
-                            stream_think_chunk(
-                                &mut think_state,
-                                &mut tag_buf,
-                                content,
-                                &think_tx,
-                            );
+                            stream_think_chunk(&mut think_state, &mut tag_buf, content, &think_tx);
                         }
                     }
 
                     // Tool calls arrive in the final delta chunk from main.py.
                     if let Some(tcs) = delta["tool_calls"].as_array() {
                         for tc in tcs {
-                            if let Ok(call) =
-                                serde_json::from_value::<ChatToolCall>(tc.clone())
-                            {
+                            if let Ok(call) = serde_json::from_value::<ChatToolCall>(tc.clone()) {
                                 tool_calls_final.push(call);
                             }
                         }
@@ -318,8 +311,13 @@ impl MlxClient {
                 .iter()
                 .filter_map(ApiToolCall::from_chat)
                 .collect();
-            // Keep only pre-tool-call text; the tool XML itself is not user-facing.
-            let text = match content.find("<tool_call>") {
+            // Keep only pre-tool-call text; strip both Qwen (<tool_call>) and
+            // Gemma (<|tool_call>) markers so raw token strings don't surface as thoughts.
+            let cut = [content.find("<tool_call>"), content.find("<|tool_call>")]
+                .into_iter()
+                .flatten()
+                .min();
+            let text = match cut {
                 Some(idx) => content[..idx].trim().to_owned(),
                 None => content,
             };
@@ -330,7 +328,11 @@ impl MlxClient {
         }
 
         Ok(CompletionResult {
-            content: if content.is_empty() { None } else { Some(content) },
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
             tool_calls: Vec::new(),
         })
     }
@@ -347,39 +349,74 @@ enum ThinkState {
 }
 
 /// Feed a delta token into the think state machine.
-/// Sends content that falls inside `<think>…</think>` to `tx`.
+/// Sends content that falls inside a thinking block to `tx`.
 ///
-/// Handles two patterns:
-/// - Explicit: `<think>…content…</think>` (model emits the open tag)
-/// - Pre-filled: `…content…</think>` (Qwen3.5 — open tag is in the prompt, not the output)
+/// Handles four patterns:
+/// - Qwen explicit: `<think>…content…</think>`
+/// - Qwen pre-filled: `…content…</think>` (open tag is in the prompt, not the output)
+/// - Gemma explicit: `<|channel>thought\n…content…<channel|>`
+/// - Gemma pre-filled: `…content…<channel|>`
 fn stream_think_chunk(
     state: &mut ThinkState,
     buf: &mut String,
     content: &str,
     tx: &mpsc::UnboundedSender<String>,
 ) {
+    const OPEN_THINK: &str = "<think>";
+    const CLOSE_THINK: &str = "</think>";
+    const OPEN_CHANNEL: &str = "<|channel>thought";
+    const CLOSE_CHANNEL: &str = "<channel|>";
+
     buf.push_str(content);
     loop {
         match state {
             ThinkState::Before => {
-                let close_pos = buf.find("</think>");
-                let open_pos = buf.find("<think>");
-                let pre_filled = close_pos.map_or(false, |ci| open_pos.map_or(true, |oi| ci <= oi));
+                let close_think = buf.find(CLOSE_THINK);
+                let open_think = buf.find(OPEN_THINK);
+                let close_channel = buf.find(CLOSE_CHANNEL);
+                let open_channel = buf.find(OPEN_CHANNEL);
+
+                // Pick the earliest close tag across both model families.
+                let earliest_close = match (close_think, close_channel) {
+                    (Some(a), Some(b)) => {
+                        Some((a.min(b), if a <= b { CLOSE_THINK } else { CLOSE_CHANNEL }))
+                    }
+                    (Some(a), None) => Some((a, CLOSE_THINK)),
+                    (None, Some(b)) => Some((b, CLOSE_CHANNEL)),
+                    (None, None) => None,
+                };
+
+                // Pick the earliest open tag across both model families.
+                let earliest_open = match (open_think, open_channel) {
+                    (Some(a), Some(b)) => {
+                        Some((a.min(b), if a <= b { OPEN_THINK } else { OPEN_CHANNEL }))
+                    }
+                    (Some(a), None) => Some((a, OPEN_THINK)),
+                    (None, Some(b)) => Some((b, OPEN_CHANNEL)),
+                    (None, None) => None,
+                };
+
+                let pre_filled = earliest_close.map_or(false, |(ci, _)| {
+                    earliest_open.map_or(true, |(oi, _)| ci <= oi)
+                });
+
                 if pre_filled {
-                    // </think> comes before any <think> — pre-filled thinking (Qwen3.5).
-                    let ci = close_pos.unwrap();
+                    let (ci, close_tag) = earliest_close.unwrap();
                     let thinking = buf[..ci].trim().to_owned();
                     if !thinking.is_empty() {
                         tx.send(thinking).ok();
                     }
-                    *buf = buf[ci + "</think>".len()..].to_owned();
+                    *buf = buf[ci + close_tag.len()..].to_owned();
                     *state = ThinkState::After;
                     break;
-                } else if let Some(oi) = open_pos {
-                    // Explicit <think> tag — standard mode.
-                    *buf = buf[oi + "<think>".len()..].to_owned();
+                } else if let Some((oi, open_tag)) = earliest_open {
+                    *buf = buf[oi + open_tag.len()..].to_owned();
+                    // Gemma open tag is followed by a newline before actual content.
+                    if open_tag == OPEN_CHANNEL && buf.starts_with('\n') {
+                        buf.drain(..1);
+                    }
                     *state = ThinkState::Inside;
-                    // loop: check if </think> is already in buf
+                    // loop: check if close tag is already in buf
                 } else {
                     // Neither tag seen yet — buffer and wait.
                     // If buffer grows too large the model isn't doing thinking (Fast mode).
@@ -391,17 +428,28 @@ fn stream_think_chunk(
                 }
             }
             ThinkState::Inside => {
-                if let Some(idx) = buf.find("</think>") {
+                // Accept either close tag inside a thinking block.
+                let think_close = buf.find(CLOSE_THINK);
+                let channel_close = buf.find(CLOSE_CHANNEL);
+                let close = match (think_close, channel_close) {
+                    (Some(a), Some(b)) => {
+                        Some((a.min(b), if a <= b { CLOSE_THINK } else { CLOSE_CHANNEL }))
+                    }
+                    (Some(a), None) => Some((a, CLOSE_THINK)),
+                    (None, Some(b)) => Some((b, CLOSE_CHANNEL)),
+                    (None, None) => None,
+                };
+                if let Some((idx, tag)) = close {
                     let before_close = buf[..idx].to_owned();
                     if !before_close.is_empty() {
                         tx.send(before_close).ok();
                     }
-                    *buf = buf[idx + "</think>".len()..].to_owned();
+                    *buf = buf[idx + tag.len()..].to_owned();
                     *state = ThinkState::After;
                     break;
                 } else {
-                    // Flush all but the last 8 bytes (guards against a split `</think>`).
-                    let safe = buf.len().saturating_sub(8);
+                    // Flush all but the last 12 bytes (guards against a split close tag).
+                    let safe = buf.len().saturating_sub(12);
                     let safe = floor_char_boundary(buf, safe);
                     if safe > 0 {
                         tx.send(buf[..safe].to_owned()).ok();
@@ -418,17 +466,15 @@ fn stream_think_chunk(
     }
 }
 
-/// Return the text that follows the `</think>` closing tag (the actual answer).
+/// Return the text that follows the thinking closing tag (the actual answer).
 fn extract_post_think(text: &str) -> String {
-    if let Some(idx) = text.find("</think>") {
-        text[idx + "</think>".len()..].trim().to_owned()
-    } else if let Some(idx) = text.find("</thinking>") {
-        text[idx + "</thinking>".len()..].trim().to_owned()
-    } else {
-        text.trim().to_owned()
+    for tag in &["</think>", "</thinking>", "<channel|>"] {
+        if let Some(idx) = text.find(tag) {
+            return text[idx + tag.len()..].trim().to_owned();
+        }
     }
+    text.trim().to_owned()
 }
-
 
 fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
     while idx > 0 && !s.is_char_boundary(idx) {

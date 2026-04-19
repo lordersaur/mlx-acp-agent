@@ -2,7 +2,7 @@
 
 A Codex/Claude Code-style local coding agent written in Rust, speaking ACP (Agent Control Protocol) JSON-RPC 2.0 over stdio — used by the Zed editor.
 
-**Model:** `mlx-community/Qwen3.5-9B-OptiQ-4bit` on M1 Pro 16GB — OmniCoder is no longer the target model.  
+**Model:** `mlx-community/gemma-4-e4b-it-4bit` on M1 Pro 16GB — OmniCoder is no longer the target model.  
 **Fine-tuning machine:** MacBook Pro M1 Pro with 16GB RAM — LoRA model creation and experiments are planned around this local hardware constraint.  
 **Binary:** `target/release/rust-agent`  
 **MLX server:** `~/python-mlx-sv/main.py` (FastAPI, runs at `http://127.0.0.1:8000`)
@@ -85,8 +85,21 @@ src/
 | 10 | Conversation history UI (like Claude Code / Codex) | 🔲 Next |
 | 11 | Subagents — `delegate_task_tool(task, tools, max_steps)` | 🔲 Planned |
 | 12 | LoRA fine-tuning pipeline for the local agent model | 🔲 Planned |
+| 12 | LoRA fine-tuning pipeline for the local agent model | 🔲 Planned |
 
 **Next:** Phase 10 — Conversation history panel in Zed showing past sessions with timestamps, searchable turns, and resume support (like `/history` in Claude Code or Codex's session list).
+
+### Phase 12 — LoRA Fine-tuning (design)
+Goal: create a local LoRA fine-tuning workflow for improving the agent model on real coding-agent traces, constrained to the available MacBook Pro M1 Pro with 16GB RAM.
+
+Key pieces:
+- **Dataset extraction** — convert successful session history from `~/.mlx-acp-agent/history/` into training examples, preserving user prompts, assistant answers, tool calls, and tool results where useful
+- **Data cleaning** — remove secrets, local credentials, irrelevant command noise, failed tool loops, and low-quality turns before training
+- **Training format** — produce chat/tool-calling examples compatible with the MLX/Qwen chat template used by `~/python-mlx-sv/main.py`
+- **LoRA training** — run MLX-compatible LoRA fine-tuning locally with conservative batch size, sequence length, and adapter rank settings suitable for 16GB unified memory
+- **Evaluation set** — keep a small held-out set of agent tasks to compare baseline vs LoRA behavior before adopting the adapter
+- **Adapter loading** — update the MLX server config to load the selected LoRA adapter without replacing the base quantized model
+- **Rollback path** — allow disabling the LoRA adapter quickly if tool calling, formatting, or instruction following regresses
 
 ### Phase 10 — Conversation History (design)
 Goal: surface past sessions and turns inside the Zed ACP panel, similar to how Claude Code shows prior conversation history and Codex lists past task runs.
