@@ -1,7 +1,7 @@
 use std::env;
 
 pub const DEFAULT_MLX_URL: &str = "http://127.0.0.1:8000/v1/chat/completions";
-pub const DEFAULT_MODEL_NAME: &str = "mlx-community/Qwen3.5-9B-OptiQ-4bit";
+pub const DEFAULT_MODEL_NAME: &str = "mlx-community/gemma-4-e4b-it-OptiQ-4bit";
 // pub const DEFAULT_MODEL_NAME: &str = "mlx-community/gpt-oss-20b-MXFP4-Q4";
 pub const STALE_MODEL_ALIASES: &[&str] = &["mlx", "mlx-community"];
 
@@ -56,8 +56,8 @@ mod tests {
     #[test]
     fn keeps_explicit_model_name() {
         assert_eq!(
-            resolve_model_name(Some("mlx-community/Qwen3.5-9B-OptiQ-4bit")),
-            "mlx-community/Qwen3.5-9B-OptiQ-4bit"
+            resolve_model_name(Some("mlx-community/gemma-4-e4b-it-OptiQ-4bit")),
+            "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
         );
     }
 }

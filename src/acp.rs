@@ -35,47 +35,27 @@ const PROTOCOL_VERSION: u64 = 1;
 const MODE_PROMPTS: &[(&str, &str)] = &[
     (
         "ask",
-        "Current mode: ask.\n\
-Prefer inspection and explanation over broad changes.\n\
-Read relevant files before answering questions about them.\n\
-For abstract questions, inspect the likely defining files or symbols rather than searching the exact phrase.\n\
-Identify the object type first and inspect the code that defines that type.\n\
-Reuse evidence already gathered instead of re-reading the same files.\n\
-Do not make changes unless the user explicitly asks.",
+        "Current mode: ask. Read-only inspection.\n\
+For abstract questions, inspect defining symbols rather than searching phrases.\n\
+Identify the object type and find its definition code first.",
     ),
     (
         "edit",
-        "Current mode: edit.\n\
-Use tools to inspect files before modifying them.\n\
-Make only the changes asked for — do not refactor or clean up surrounding code.\n\
-When the request names an abstract concept, inspect the relevant implementation first.\n\
-Identify the object type first and inspect the code that defines that type.\n\
-Reuse evidence already gathered instead of re-reading the same files.\n\
-Validate changes (compile, test) when the user asks or after non-trivial edits.",
+        "Current mode: edit. Focus on requested changes.\n\
+Inspect relevant implementation symbols before modifying.\n\
+Do not refactor or clean up surrounding code unless asked.",
     ),
     (
         "fast",
-        "/no_think\nCurrent mode: fast.\n\
-You may inspect the repo, search the web, fetch URLs, run commands, \
-manage terminal sessions, create/edit/delete files, and validate results.\n\
+        "/no_think\nCurrent mode: fast. Full tool access.\n\
 Respond directly and concisely — skip internal reasoning.",
     ),
     (
         "agent",
-        "Current mode: agent.\n\
-You may inspect the repo, search the web, fetch URLs, run commands, \
-manage terminal sessions, create/edit/delete files, and validate results.\n\
-Always inspect (read files, list dirs, search code) before answering questions or making changes.\n\
-Do not answer repo-specific questions from prior knowledge; read the code first.\n\
-For counts, totals, and ranking questions, prefer precise commands or exact file reads over broad search summaries.\n\
-For Rust test counts, count `#[test]` and `#[tokio::test]` functions, not `#[cfg(test)]` modules or comments.\n\
-For abstract concepts like tools, routes, handlers, entrypoints, config, schema, migrations, models, and env vars, inspect the likely registry, schema, dispatch, or definition code instead of searching the exact phrase.\n\
-Identify the object type first: routes, RPC methods, tools, config, tests, commands, files, or schemas.\n\
-Do not substitute one object type for another.\n\
-For routes or methods, inspect the actual server/router/RPC dispatch code and distinguish them from tools.\n\
-If the repo is a protocol server rather than an HTTP app, report the protocol methods or dispatch entries instead of inventing HTTP routes.\n\
-For tool totals, verify the complete registry or schema list instead of stopping after one partial file read.\n\
-Before another tool call, reuse evidence already gathered and keep a short internal summary of inspected paths, key findings, and the remaining question.",
+        "Current mode: agent. Full tool access.\n\
+Always ground your first search in concrete code symbols (RPC methods, handlers, registries, or stores) rather than broad semantic phrases.\n\
+For routes or protocol methods, find the actual dispatch or router code first.\n\
+Verify tool or method totals by reading the complete registry definition.",
     ),
 ];
 
@@ -83,6 +63,7 @@ const TOOL_KINDS: &[(&str, &str)] = &[
     ("read_file_tool", "read"),
     ("list_dir_tool", "read"),
     ("search_code_tool", "search"),
+    ("find_file_tool", "search"),
     ("web_search_tool", "search"),
     ("web_fetch_tool", "read"),
     ("run_command_tool", "execute"),
@@ -1410,8 +1391,7 @@ impl ToolExecutor for ProgressRegistry {
         // Keep model reasoning in the thought stream, not inside the expandable
         // tool-call panel. Tool panels should describe the tool action itself.
         self.active_reasoning.lock().unwrap().take();
-        let initial_text =
-            render_tool_started(name, &arguments).unwrap_or_else(|| "Starting.".to_owned());
+        let initial_text = render_tool_metadata(name, &arguments);
 
         let mut start_update = json!({
             "sessionUpdate": "tool_call",
@@ -1490,7 +1470,7 @@ impl ToolExecutor for ProgressRegistry {
                 let error = e.to_string();
                 (
                     render_tool_error(name, &arguments, &error),
-                    Some(Value::String(error)),
+                    Some(parse_tool_output(&error)),
                     true,
                 )
             }
@@ -1668,6 +1648,8 @@ fn build_messages(
         user_text.to_owned()
     };
 
+    system_parts.push(SYSTEM_PROMPT.to_owned());
+
     if let Some(mode_prompt) = MODE_PROMPTS
         .iter()
         .find(|(id, _)| *id == mode_id)
@@ -1675,8 +1657,6 @@ fn build_messages(
     {
         system_parts.push(mode_prompt.to_owned());
     }
-
-    system_parts.push(SYSTEM_PROMPT.to_owned());
 
     if !active_cmd_sessions.is_empty() {
         let mut lines = vec!["Active terminal sessions:".to_owned()];
@@ -1729,6 +1709,21 @@ fn build_messages(
         ));
     }
 
+    // Inject high-priority synthetic instructions immediately before the user turn.
+    // This leverages the "context pull" toward the end of the prompt without
+    // contaminating the actual user text.
+    if turns.is_empty() && !resume_request {
+        messages.push(ConversationMessage::new(
+            "system",
+            "First step: Ground your first action in concrete code symbols (RPC methods, handlers, registries, or stores) relevant to this request. Do not use broad semantic searches.",
+        ));
+    } else if turns.len() >= 5 {
+        messages.push(ConversationMessage::new(
+            "system",
+            "Reminder: Ground all actions in code symbols. Trace flows from entry points. Keep answers concise. If stuck, notify me.",
+        ));
+    }
+
     messages.push(ConversationMessage::new("user", effective_user_text));
     messages
 }
@@ -1765,9 +1760,23 @@ fn render_tool_title(name: &str, args: &Map<String, Value>) -> String {
     let filename = str_arg(args, "filename");
 
     match name {
-        "read_file_tool" => format!("Read {}", display_value(&path, ".")),
+        "read_file_tool" => render_read_title(args),
         "list_dir_tool" => format!("List {}", display_value(&path, ".")),
-        "search_code_tool" => format!("Search {}", display_value(&query, "<empty>")),
+        "search_code_tool" => {
+            if path.is_empty() {
+                format!("Search {}", display_value(&query, "<empty>"))
+            } else {
+                format!(
+                    "Search {} in {}",
+                    display_value(&query, "<empty>"),
+                    display_value(&path, "<empty>")
+                )
+            }
+        }
+        "find_file_tool" => {
+            let pattern = str_arg(args, "pattern");
+            format!("Find {}", display_value(&pattern, "<empty>"))
+        }
         "web_search_tool" => format!("Search web {}", display_value(&query, "<empty>")),
         "web_fetch_tool" => format!("Fetch {}", display_value(&url, "<empty>")),
         "run_command_tool" => format!("Run {}", display_value(&cmd, "<empty>")),
@@ -1801,6 +1810,14 @@ fn render_tool_title(name: &str, args: &Map<String, Value>) -> String {
     }
 }
 
+fn render_read_title(args: &Map<String, Value>) -> String {
+    let path = str_arg(args, "path");
+    let start: usize = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let limit: usize = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+    let end = start + limit - 1;
+    format!("Read {} ({} - {})", display_value(&path, "."), start, end)
+}
+
 fn display_value(value: &str, fallback: &str) -> String {
     if value.is_empty() {
         fallback.to_owned()
@@ -1816,53 +1833,158 @@ fn str_arg(args: &Map<String, Value>, key: &str) -> String {
         .to_owned()
 }
 
-fn render_tool_started(name: &str, args: &Map<String, Value>) -> Option<String> {
-    let path = str_arg(args, "path");
-    let query = str_arg(args, "query");
-    let url = str_arg(args, "url");
-    let cmd = str_arg(args, "cmd");
-    let session_id = str_arg(args, "session_id");
-    let filename = str_arg(args, "filename");
-
-    Some(match name {
-        "read_file_tool" => format!("Reading `{path}`."),
-        "list_dir_tool" => format!("Listing `{}`.", if path.is_empty() { "." } else { &path }),
-        "search_code_tool" => format!("Searching for `{query}`."),
-        "web_search_tool" => format!("Searching the web for `{query}`."),
-        "web_fetch_tool" => format!("Fetching `{url}`."),
-        "run_command_tool" => format!("Running `{cmd}`."),
-        "list_command_sessions_tool" => "Listing terminal sessions.".to_owned(),
-        "start_command_session_tool" => format!("Starting terminal session for `{cmd}`."),
-        "read_command_session_tool" => format!("Reading terminal session `{session_id}`."),
-        "write_command_session_tool" => format!("Writing to terminal session `{session_id}`."),
-        "terminate_command_session_tool" => {
-            format!("Terminating terminal session `{session_id}`.")
+fn render_tool_finished(name: &str, args: &Map<String, Value>, output: &str) -> Option<String> {
+    Some(match tool_visible_style(name) {
+        ToolVisibleStyle::Json => render_tool_json_document(name, args, output, false),
+        ToolVisibleStyle::Diff => render_diff_output(output),
+        ToolVisibleStyle::Terminal => render_terminal_output(output),
+        ToolVisibleStyle::Default => {
+            let metadata = render_tool_metadata(name, args);
+            let (language, output) = render_tool_payload(output);
+            format!("{metadata}\n\nOutput:\n```{language}\n{output}\n```")
         }
-        "edit_file_tool" => format!("Editing `{path}`."),
-        "patch_file_tool" => format!("Patching `{path}`."),
-        "delete_path_tool" => format!("Deleting `{path}`."),
-        "create_artifact_tool" => {
-            let fname = if filename.is_empty() {
-                "<auto>".to_owned()
-            } else {
-                filename
-            };
-            format!("Creating `{fname}`.")
-        }
-        _ => format!("Running `{name}`."),
     })
 }
 
-fn render_tool_finished(_name: &str, _args: &Map<String, Value>, output: &str) -> Option<String> {
-    Some(output.to_owned())
-}
-
-fn render_tool_error(_name: &str, _args: &Map<String, Value>, error: &str) -> String {
-    error.to_owned()
+fn render_tool_error(name: &str, args: &Map<String, Value>, error: &str) -> String {
+    match tool_visible_style(name) {
+        ToolVisibleStyle::Json => render_tool_json_document(name, args, error, true),
+        _ => {
+            let metadata = render_tool_metadata(name, args);
+            let (language, error) = render_tool_payload(error);
+            format!("{metadata}\n\nError:\n```{language}\n{error}\n```")
+        }
+    }
 }
 
 fn parse_tool_output(output: &str) -> Value {
     serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.to_owned()))
+}
+
+fn render_tool_metadata(name: &str, args: &Map<String, Value>) -> String {
+    let path = str_arg(args, "path");
+    let query = str_arg(args, "query");
+    let cmd = str_arg(args, "cmd");
+    let url = str_arg(args, "url");
+    let pattern = str_arg(args, "pattern");
+    let session_id = str_arg(args, "session_id");
+    let filename = str_arg(args, "filename");
+
+    let mut lines = Vec::new();
+    match name {
+        "read_file_tool" => {
+            let start: usize =
+                args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let limit: usize = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+            lines.push(format!("Path: {}", display_value(&path, ".")));
+            lines.push(format!("Lines: {} - {}", start, start + limit - 1));
+        }
+        "search_code_tool" => {
+            lines.push(format!("Query: {}", display_value(&query, "<empty>")));
+            if !path.is_empty() {
+                lines.push(format!("Path: {path}"));
+            }
+        }
+        "find_file_tool" => lines.push(format!("Pattern: {}", display_value(&pattern, "<empty>"))),
+        "list_dir_tool" => lines.push(format!("Path: {}", display_value(&path, "."))),
+        "run_command_tool" | "start_command_session_tool" => {
+            lines.push(format!("Command: {}", display_value(&cmd, "<empty>")))
+        }
+        "read_command_session_tool"
+        | "write_command_session_tool"
+        | "terminate_command_session_tool" => lines.push(format!(
+            "Session: {}",
+            display_value(&session_id, "<empty>")
+        )),
+        "web_search_tool" => lines.push(format!("Query: {}", display_value(&query, "<empty>"))),
+        "web_fetch_tool" => lines.push(format!("URL: {}", display_value(&url, "<empty>"))),
+        "edit_file_tool" | "patch_file_tool" | "delete_path_tool" => {
+            lines.push(format!("Path: {}", display_value(&path, "<empty>")))
+        }
+        "create_artifact_tool" => {
+            lines.push(format!("Filename: {}", display_value(&filename, "<auto>")))
+        }
+        _ => {}
+    }
+
+    if lines.is_empty() {
+        "Input: <none>".to_owned()
+    } else {
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolVisibleStyle {
+    Json,
+    Diff,
+    Terminal,
+    Default,
+}
+
+fn tool_visible_style(name: &str) -> ToolVisibleStyle {
+    match name {
+        "read_file_tool" | "search_code_tool" | "find_file_tool" | "list_dir_tool" => {
+            ToolVisibleStyle::Json
+        }
+        "patch_file_tool" | "edit_file_tool" | "create_artifact_tool" | "delete_path_tool" => {
+            ToolVisibleStyle::Diff
+        }
+        "run_command_tool"
+        | "start_command_session_tool"
+        | "read_command_session_tool"
+        | "write_command_session_tool"
+        | "terminate_command_session_tool" => ToolVisibleStyle::Terminal,
+        _ => ToolVisibleStyle::Default,
+    }
+}
+
+fn render_tool_json_document(
+    name: &str,
+    args: &Map<String, Value>,
+    output: &str,
+    is_error: bool,
+) -> String {
+    let output_key = if is_error { "error" } else { "output" };
+    let mut document = Map::new();
+    document.insert("tool".to_owned(), Value::String(name.to_owned()));
+    document.insert("input".to_owned(), Value::Object(args.clone()));
+    document.insert(
+        "status".to_owned(),
+        Value::String(if is_error { "error" } else { "completed" }.to_owned()),
+    );
+    document.insert(output_key.to_owned(), parse_tool_output(output));
+
+    format!(
+        "```json\n{}\n```",
+        render_json_value(&Value::Object(document))
+    )
+}
+
+fn render_diff_output(output: &str) -> String {
+    if output.starts_with("Diff:")
+        || output.starts_with("Updated:")
+        || output.starts_with("Created:")
+    {
+        output.to_owned()
+    } else {
+        format!("Diff:\n```diff\n{output}\n```")
+    }
+}
+
+fn render_terminal_output(output: &str) -> String {
+    format!("Terminal:\n```text\n{output}\n```")
+}
+
+fn render_tool_payload(text: &str) -> (&'static str, String) {
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => ("json", render_json_value(&value)),
+        Err(_) => ("text", text.to_owned()),
+    }
+}
+
+fn render_json_value(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn terminal_command_and_args(cmd: &str) -> (String, Vec<String>) {
@@ -1958,7 +2080,7 @@ mod tests {
 
     use super::{
         AcpProgressSink, ClientCaller, ProgressRegistry, build_messages, is_continue_prompt,
-        parse_tool_output, render_tool_finished,
+        parse_tool_output, render_tool_error, render_tool_finished, render_tool_title,
     };
     use crate::agent_loop::{ModelClient, ToolExecutor};
     use crate::mlx_client::ChatMessage;
@@ -2033,31 +2155,82 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_finished_returns_raw_output() {
+    fn render_tool_finished_edit_uses_diff_style() {
         let args = json!({"path": "notes.txt"}).as_object().cloned().unwrap();
-        assert_eq!(
-            render_tool_finished("edit_file_tool", &args, "raw edit output"),
-            Some("raw edit output".to_owned())
+        let output = "Diff: /tmp/notes.txt\n```\n- old\n+ new\n```";
+        let rendered = render_tool_finished("edit_file_tool", &args, output).expect("rendered");
+        assert!(rendered.starts_with("Diff: /tmp/notes.txt"), "{rendered}");
+        assert!(!rendered.contains("**Tool Call:"), "{rendered}");
+        assert!(!rendered.contains("Input:\n```json"), "{rendered}");
+        assert!(rendered.contains("- old"), "{rendered}");
+        assert!(rendered.contains("+ new"), "{rendered}");
+    }
+
+    #[test]
+    fn render_tool_finished_read_uses_json_style_and_title_has_range() {
+        let args = json!({"path": "src/acp.rs", "start_line": 10, "limit": 20})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let rendered =
+            render_tool_finished("read_file_tool", &args, "content here").expect("rendered");
+        assert!(rendered.starts_with("```json"), "{rendered}");
+        assert!(
+            rendered.contains("\"tool\": \"read_file_tool\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"path\": \"src/acp.rs\""), "{rendered}");
+        assert!(
+            rendered.contains("\"output\": \"content here\""),
+            "{rendered}"
         );
         assert_eq!(
-            render_tool_finished("patch_file_tool", &args, "raw patch output"),
-            Some("raw patch output".to_owned())
-        );
-        assert_eq!(
-            render_tool_finished("delete_path_tool", &args, "raw delete output"),
-            Some("raw delete output".to_owned())
+            render_tool_title("read_file_tool", &args),
+            "Read src/acp.rs (10 - 29)"
         );
     }
 
     #[test]
-    fn render_tool_finished_returns_raw_command_output() {
+    fn render_tool_finished_command_output_wrapped() {
         let args = json!({"cmd": "tail -f log.txt"})
             .as_object()
             .cloned()
             .unwrap();
-        let output = "$ tail -f log.txt\n\nsession_id: cmdsess_abc123\n\nrunning: true\n\nstdout:\nready\n\nstderr:\n\n[command is still running in session `cmdsess_abc123`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]";
+        let output = "stdout:\nready";
         let rendered = render_tool_finished("run_command_tool", &args, output).expect("rendered");
-        assert_eq!(rendered, output);
+        assert!(rendered.starts_with("Terminal:"), "{rendered}");
+        assert!(!rendered.contains("Input:\n```json"), "{rendered}");
+        assert!(
+            rendered.contains("```text\nstdout:\nready\n```"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_tool_title_search_includes_scoped_path() {
+        let args = json!({"query": "run_agent_loop", "path": "src/agent_loop.rs"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            render_tool_title("search_code_tool", &args),
+            "Search run_agent_loop in src/agent_loop.rs"
+        );
+    }
+
+    #[test]
+    fn render_tool_error_formats_structured_error_json() {
+        let args = json!({"path": "missing.rs"}).as_object().cloned().unwrap();
+        let error = r#"{"code":"read_file_failed","message":"missing","diagnostics":{"path":"missing.rs"}}"#;
+        let rendered = render_tool_error("read_file_tool", &args, error);
+        assert!(rendered.starts_with("```json"), "{rendered}");
+        assert!(!rendered.contains("Input:\n```json"), "{rendered}");
+        assert!(rendered.contains("\"status\": \"error\""), "{rendered}");
+        assert!(rendered.contains("\"error\""), "{rendered}");
+        assert!(
+            rendered.contains("\"code\": \"read_file_failed\""),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -2258,15 +2431,21 @@ mod tests {
                     == Some("tool_call_update")
             })
             .expect("tool_call_update");
-        assert_eq!(
-            update["params"]["update"]["rawOutput"]["filename"],
-            Value::String("summary.md".to_owned())
-        );
+        let raw_output = update["params"]["update"]["rawOutput"]
+            .as_str()
+            .expect("rawOutput should be a string");
+        assert!(raw_output.contains("summary.md"), "rawOutput: {raw_output}");
         let update_text = update["params"]["update"]["content"][0]["content"]["text"]
             .as_str()
             .expect("update text");
-        assert!(update_text.contains(r#""filename":"summary.md""#));
-        assert!(update_text.contains("# Summary"));
+        assert!(
+            update_text.contains("summary.md"),
+            "update_text: {update_text}"
+        );
+        assert!(
+            update_text.contains("# Summary"),
+            "update_text: {update_text}"
+        );
     }
 
     #[tokio::test]
@@ -2311,9 +2490,12 @@ mod tests {
                     == Some("tool_call")
             })
             .expect("tool_call");
-        assert_eq!(
-            tool_call["params"]["update"]["content"][0]["content"]["text"],
-            Value::String("Patching `notes.txt`.".to_owned())
+        let tool_call_text = tool_call["params"]["update"]["content"][0]["content"]["text"]
+            .as_str()
+            .expect("tool_call text");
+        assert!(
+            tool_call_text.contains("notes.txt"),
+            "tool_call_text: {tool_call_text}"
         );
 
         let finished = updates
@@ -2330,9 +2512,18 @@ mod tests {
         let finished_text = finished["params"]["update"]["content"][0]["content"]["text"]
             .as_str()
             .expect("finished text");
-        assert!(finished_text.contains(r#""status":"patched""#));
-        assert!(finished_text.contains("--- old"));
-        assert!(finished_text.contains("+++ new"));
+        assert!(
+            finished_text.contains("Diff:"),
+            "finished_text: {finished_text}"
+        );
+        assert!(
+            finished_text.contains("- old"),
+            "finished_text: {finished_text}"
+        );
+        assert!(
+            finished_text.contains("+ new"),
+            "finished_text: {finished_text}"
+        );
     }
 
     #[tokio::test]

@@ -72,10 +72,26 @@ pub fn list_dir(cwd: &Path, path: &str) -> Result<Vec<String>> {
     Ok(entries)
 }
 
-pub fn search_code(cwd: &Path, query: &str, glob: Option<&str>) -> Result<String> {
+pub fn search_code(
+    cwd: &Path,
+    query: &str,
+    glob: Option<&str>,
+    path: Option<&str>,
+) -> Result<String> {
     let base = cwd
         .canonicalize()
         .with_context(|| format!("failed to resolve workspace root {}", cwd.display()))?;
+
+    let search_root = if let Some(p) = path {
+        let resolved = base.join(p);
+        if resolved.exists() {
+            resolved.display().to_string()
+        } else {
+            return Ok(format!("path not found: {p}"));
+        }
+    } else {
+        base.display().to_string()
+    };
 
     let mut rg_args = vec![
         "-n".to_owned(),
@@ -102,7 +118,7 @@ pub fn search_code(cwd: &Path, query: &str, glob: Option<&str>) -> Result<String
         rg_args.push(glob.to_owned());
     }
     rg_args.push(query.to_owned());
-    rg_args.push(base.display().to_string());
+    rg_args.push(search_root);
 
     let output = match Command::new("rg").args(&rg_args).output() {
         Ok(output) => output,
@@ -129,6 +145,49 @@ pub fn search_code(cwd: &Path, query: &str, glob: Option<&str>) -> Result<String
     }
 
     Ok(stdout)
+}
+
+pub fn find_files(cwd: &Path, pattern: &str) -> Result<String> {
+    let base = cwd
+        .canonicalize()
+        .with_context(|| format!("failed to resolve workspace root {}", cwd.display()))?;
+
+    let output = Command::new("rg")
+        .args([
+            "--files",
+            "--hidden",
+            "--glob",
+            "!.git",
+            "--glob",
+            "!.venv/**",
+            "--glob",
+            "!**/__pycache__/**",
+            "--glob",
+            pattern,
+            base.to_str().unwrap_or("."),
+        ])
+        .output()
+        .context("failed to run rg --files")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut paths: Vec<&str> = stdout.lines().collect();
+    paths.sort();
+
+    if paths.is_empty() {
+        return Ok(format!("No files matching `{pattern}`."));
+    }
+
+    let relative: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            std::path::Path::new(p)
+                .strip_prefix(&base)
+                .map(|r| r.display().to_string())
+                .unwrap_or_else(|_| p.to_string())
+        })
+        .collect();
+
+    Ok(relative.join("\n"))
 }
 
 pub fn delete_path(cwd: &Path, path: &str, recursive: bool) -> Result<String> {
@@ -347,10 +406,10 @@ mod tests {
         )
         .expect("write file");
 
-        let matches = search_code(tempdir.path(), "alpha", Some("*.rs")).expect("search");
+        let matches = search_code(tempdir.path(), "alpha", Some("*.rs"), None).expect("search");
         assert!(matches.contains("src/lib.rs:1:fn alpha() {}"));
 
-        let none = search_code(tempdir.path(), "gamma", Some("*.rs")).expect("search");
+        let none = search_code(tempdir.path(), "gamma", Some("*.rs"), None).expect("search");
         assert_eq!(none, "No matches found.");
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::mlx_client::{
     ApiToolCall, ChatMessage, ChatToolCall, ChatToolCallFunction, CompletionResult, MlxClient,
@@ -9,49 +9,16 @@ use crate::mlx_client::{
 use crate::model_parser::extract_thought_blocks;
 
 pub const SYSTEM_PROMPT: &str = "\
-You are a coding agent inside the user's editor. Use tools for all file and workspace operations — never guess.
+You are a coding agent inside the user's editor.
+Ground all claims in code evidence via tools.
 
-Thinking:
-- Think once, decide, act. Do not revisit a decision you already made.
-- Never repeat the same reasoning in the think block. Each sentence must add new information.
-- If you already know the answer from context (branch name, file path, tool list), use it — do not re-derive it.
-
-Tools:
-- Call tools immediately. Do not narrate what you are about to do — just call the tool.
-- Call independent tools in parallel.
-- Max 3 read_file_tool calls per response. Batch reads; continue next turn if more are needed.
-- Never read the same file twice in one turn.
-- If the task names a specific file, function, or symbol: your first action must be search_code_tool — never list_dir_tool. Use list_dir_tool only when you genuinely need to discover what files exist in an unknown directory.
-- Search-anchor rule: use search_code_tool to locate a symbol. If the returned snippet answers the question, stop — do not open the file. If you need more context, read ONLY the relevant function: use the line number from the search result as start_line with a limit of 30-50 lines.
-- BANNED: reading a file at start_line: 1 after search_code_tool already returned a line number for that file. BANNED: reading a file in sequential 100-line pages (start_line: 1, 101, 201…). Both are top-to-bottom paging and waste turns. If you catch yourself about to do either, stop and use search_code_tool instead.
-- For explain-the-flow or trace-how-X-works tasks: search for specific function names (e.g. handle_session_prompt, run_agent_loop, persist_session), not broad keywords or module names. search_code_tool returns 3 lines of context around each match — if that is enough, answer directly. If not, read only that function using the returned line number as start_line.
-- Never answer implementation questions from CLAUDE.md, README, or comments alone. If the question is about how code works, search the actual source and read the relevant function before answering.
-- Use patch_file_tool for all targeted changes: adding lines, modifying values, appending code. Keep patch_file_tool old_text/new_text as small as possible: prefer replacing a single expression or inserting one helper over replacing a whole function. Use edit_file_tool only when rewriting an entire file from scratch — keep the instruction one plain sentence, no quoted text inside it.
-- Never announce that you are about to make a change and then stop. Call the tool immediately or say you cannot do it.
-- Never claim to have made a change unless patch_file_tool or edit_file_tool returned successfully. If the last tool call was not one of those, no file was modified — do not say it was.
-- If the user asks a yes/no question, the agent should answer it directly before explaining.
-- If the requested change already exists, say so and do not patch the file.
-- Do not write meta labels like \"Self-Correction\", \"Refinement\", or similar process notes in thoughts or answers.
-
-Files:
-- Always use the exact file path returned by list_dir_tool or search_code_tool. Never construct a file path from memory — always get it from a tool first. If the user's message mentions a file path, verify it exists via search_code_tool before using it.
-- list_dir_tool → answer from names only unless user asked what each file does.
-- For counts, use a precise rg/grep/wc command via run_command_tool.
-
-Commands:
-- Long-running tasks (cargo build, cargo test, npm install): use start_command_session_tool, then poll with read_command_session_tool until `running: false` or `exit_code` appears.
-- Never run build or test commands proactively. Exception: if you just modified source code, run cargo test once to verify the change compiles and tests pass.
-- Always confirm the exit code of a run_command_tool call before reporting success.
-
-Output:
-- When a task is done (command exited 0, file written, etc.): state what was done in one sentence and stop. Do not speculate about next steps.
-- If two different approaches both failed, stop and ask the user instead of trying a third.
-- If the task is ambiguous (no specific file, function, or error cited), ask one clarifying question before using any tool. This applies even if you find something relevant during search — do not act on it without confirming it is the intended target.
-- Ambiguous requests include phrases like \"something is slow\", \"make it smarter\", \"clean up the repo\", and \"fix the thing from last time\". Ask what the user means; do not search or edit.
-- Never cite a specific line number in your answer unless you have read that line with read_file_tool.
-- Use plain arrows like `->`; never use LaTeX arrows like `$\\rightarrow$`.
-- If you can't do something, say so.";
-
+Rules:
+- Do not narrate or plan. Act immediately.
+- Start with concrete symbols, dispatch entries, or store functions.
+- Avoid semantic phrase searches. Use code tokens.
+- One small grounded action per turn.
+- Be concise. Cite exact file/function names in the final answer.
+";
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -237,20 +204,15 @@ pub async fn run_agent_loop(
         };
 
         // Drain any chunks that arrived just before complete() returned.
-        let mut got_stream_chunks = false;
         while let Ok(chunk) = think_rx.try_recv() {
-            got_stream_chunks = true;
             if let Some(ref mut handler) = on_thought {
                 handler.on_thought_chunk(&chunk).await;
             }
         }
-        let _ = got_stream_chunks;
 
         // Signal end-of-streaming-thought so Zed can flush a separator.
-        if on_thought.is_some() {
-            if let Some(ref mut handler) = on_thought {
-                handler.on_thought_end().await;
-            }
+        if let Some(ref mut handler) = on_thought {
+            handler.on_thought_end().await;
         }
 
         // Streaming path already stripped think tags from content; non-streaming
@@ -277,7 +239,6 @@ pub async fn run_agent_loop(
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_default();
             let answer = prevent_malformed_tool_call_answer(answer);
-            let answer = prevent_unsupported_completion_claims(answer, &all_tool_results);
 
             return Ok(LoopResult {
                 answer,
@@ -320,17 +281,14 @@ pub async fn run_agent_loop(
             .collect();
         conversation.push(ChatMessage::assistant_with_tool_calls(chat_tool_calls));
 
-        // Execute tools (parallel when multiple).
-        let executions = execute_tools(tool_calls, tools).await;
+        // Execute tools (parallel when multiple), but avoid repeating the exact
+        // same failing call indefinitely.
+        let executions = execute_tools(tool_calls, tools, &all_tool_results).await;
         all_tool_results.extend(executions.iter().cloned());
 
         // Push tool result messages with matching tool_call_id.
         for exec in &executions {
-            let content = if exec.error {
-                format!("Error: {}", exec.result)
-            } else {
-                exec.result.clone()
-            };
+            let content = model_tool_result_content(exec);
             conversation.push(ChatMessage::tool_result(&exec.id, content));
         }
     }
@@ -342,134 +300,12 @@ pub async fn run_agent_loop(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Qwen3.5 narration detection
-// ---------------------------------------------------------------------------
-
-/// Returns true when the model's response looks like mid-task narration rather
-/// than a genuine final answer. Qwen3.5-9B occasionally produces text like
-/// "cargo clean done, now I'll run cargo test" without calling the tool.
-/// Claude/GPT-4o do not exhibit this behavior.
-fn prevent_unsupported_completion_claims(answer: String, tool_results: &[ToolExecution]) -> String {
-    let lower = answer.to_lowercase();
-    let first_person_completion_claim = [
-        "i created",
-        "i added",
-        "i updated",
-        "i modified",
-        "i edited",
-        "i patched",
-        "i deleted",
-        "i wrote",
-        "i implemented",
-        "i applied",
-        "i have created",
-        "i have added",
-        "i have updated",
-        "i have modified",
-        "i have edited",
-        "i have patched",
-        "i have deleted",
-        "i have written",
-        "i have implemented",
-        "i have applied",
-        "i've created",
-        "i've added",
-        "i've updated",
-        "i've modified",
-        "i've edited",
-        "i've patched",
-        "i've deleted",
-        "i've written",
-        "i've implemented",
-        "i've applied",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase))
-        || lower.starts_with("done")
-        || lower.starts_with("fixed")
-        || lower.starts_with("created")
-        || lower.starts_with("added")
-        || lower.starts_with("updated")
-        || lower.starts_with("patched")
-        || lower.starts_with("implemented");
-    let has_successful_tool = |names: &[&str]| {
-        tool_results
-            .iter()
-            .any(|tr| !tr.error && names.iter().any(|name| tr.name == *name))
-    };
-    let has_successful_command_result = || {
-        tool_results.iter().any(|tr| {
-            if tr.error {
-                return false;
-            }
-            if !matches!(
-                tr.name.as_str(),
-                "run_command_tool" | "read_command_session_tool"
-            ) {
-                return false;
-            }
-            tr.result.contains("exit_code: 0")
-                || tr.result.contains("\"exit_code\":0")
-                || tr.result.contains("\"exit_code\": 0")
-        })
-    };
-
-    let claims_file_change = [
-        "created",
-        "added",
-        "updated",
-        "modified",
-        "edited",
-        "patched",
-        "deleted",
-        "wrote",
-        "implemented",
-        "applied",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase));
-    let file_change_tools = [
-        "create_artifact_tool",
-        "edit_file_tool",
-        "patch_file_tool",
-        "delete_path_tool",
-    ];
-    if first_person_completion_claim
-        && claims_file_change
-        && !has_successful_tool(&file_change_tools)
-    {
-        return "I do not have a successful file-write tool result confirming that change."
-            .to_owned();
-    }
-
-    let first_person_command_claim = [
-        "i ran",
-        "i run",
-        "i executed",
-        "i have run",
-        "i have executed",
-        "i've run",
-        "i've executed",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase));
-    let claims_tests_passed = (first_person_completion_claim || first_person_command_claim)
-        && (lower.contains("test passed")
-            || lower.contains("tests passed")
-            || lower.contains("tests pass")
-            || lower.contains("cargo test passed"));
-    if claims_tests_passed && !has_successful_command_result() {
-        return "I do not have a successful command result confirming that tests passed."
-            .to_owned();
-    }
-
-    answer
-}
-
 fn prevent_malformed_tool_call_answer(answer: String) -> String {
-    if answer.contains("<|tool_call>") || answer.contains("<tool_call>") {
-        return "I tried to call a tool, but the tool call was malformed and could not be executed."
+    if answer.contains("<|tool_call>")
+        || answer.contains("<tool_call>")
+        || answer.contains("<tool_call|>")
+    {
+        return "I tried to call a tool, but the tool call was malformed and could not be executed. No tool action was completed."
             .to_owned();
     }
 
@@ -482,15 +318,83 @@ fn prevent_malformed_tool_call_answer(answer: String) -> String {
 // Tool execution helpers
 // ---------------------------------------------------------------------------
 
-async fn execute_tools(tool_calls: &[ApiToolCall], tools: &dyn ToolExecutor) -> Vec<ToolExecution> {
-    if tool_calls.len() == 1 {
-        return vec![execute_one(&tool_calls[0], tools).await];
-    }
+fn model_tool_result_content(exec: &ToolExecution) -> String {
+    let envelope = if exec.error {
+        json!({
+            "tool": exec.name,
+            "status": "failed",
+            "input": exec.arguments,
+            "error": model_tool_error(&exec.result),
+            "output": Value::Null,
+        })
+    } else {
+        json!({
+            "tool": exec.name,
+            "status": "completed",
+            "input": exec.arguments,
+            "error": Value::Null,
+            "output": exec.result,
+        })
+    };
 
-    join_all(tool_calls.iter().map(|tc| execute_one(tc, tools))).await
+    serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| exec.result.clone())
 }
 
-async fn execute_one(tool_call: &ApiToolCall, tools: &dyn ToolExecutor) -> ToolExecution {
+fn model_tool_error(result: &str) -> Value {
+    if let Ok(Value::Object(mut structured)) = serde_json::from_str::<Value>(result) {
+        if structured.contains_key("code")
+            || structured.contains_key("message")
+            || structured.contains_key("diagnostics")
+        {
+            let code = structured
+                .remove("code")
+                .unwrap_or_else(|| Value::String("tool_failed".to_owned()));
+            let message = structured
+                .remove("message")
+                .unwrap_or_else(|| Value::String(result.to_owned()));
+            let diagnostics = structured.remove("diagnostics");
+
+            let mut error = Map::new();
+            error.insert("code".to_owned(), code);
+            error.insert("message".to_owned(), message);
+            if let Some(diagnostics) = diagnostics {
+                error.insert("diagnostics".to_owned(), diagnostics);
+            }
+            if !structured.is_empty() {
+                error.insert("details".to_owned(), Value::Object(structured));
+            }
+            return Value::Object(error);
+        }
+    }
+
+    json!({
+        "code": "tool_failed",
+        "message": result,
+    })
+}
+
+async fn execute_tools(
+    tool_calls: &[ApiToolCall],
+    tools: &dyn ToolExecutor,
+    previous_results: &[ToolExecution],
+) -> Vec<ToolExecution> {
+    if tool_calls.len() == 1 {
+        return vec![execute_one(&tool_calls[0], tools, previous_results).await];
+    }
+
+    join_all(
+        tool_calls
+            .iter()
+            .map(|tc| execute_one(tc, tools, previous_results)),
+    )
+    .await
+}
+
+async fn execute_one(
+    tool_call: &ApiToolCall,
+    tools: &dyn ToolExecutor,
+    previous_results: &[ToolExecution],
+) -> ToolExecution {
     if !tools.has_tool(&tool_call.name) {
         return ToolExecution {
             id: tool_call.id.clone(),
@@ -501,6 +405,16 @@ async fn execute_one(tool_call: &ApiToolCall, tools: &dyn ToolExecutor) -> ToolE
                 tool_call.name,
                 tools.tool_names().join(", ")
             ),
+            error: true,
+        };
+    }
+
+    if repeated_failed_call_count(tool_call, previous_results) >= 2 {
+        return ToolExecution {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+            result: "Skipped repeated failed tool call with the same arguments. Re-read the relevant file/output and choose a different, smaller patch or another tool instead of retrying this call.".to_owned(),
             error: true,
         };
     }
@@ -524,6 +438,18 @@ async fn execute_one(tool_call: &ApiToolCall, tools: &dyn ToolExecutor) -> ToolE
             error: true,
         },
     }
+}
+
+fn repeated_failed_call_count(
+    tool_call: &ApiToolCall,
+    previous_results: &[ToolExecution],
+) -> usize {
+    previous_results
+        .iter()
+        .filter(|result| {
+            result.error && result.name == tool_call.name && result.arguments == tool_call.arguments
+        })
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +640,14 @@ mod tests {
         assert_eq!(requests.len(), 2);
         let second = &requests[1];
         // Should contain a "tool" role message with the result.
-        assert!(second.iter().any(|m| m.role == "tool"));
+        let tool_msg = second.iter().find(|m| m.role == "tool").expect("tool msg");
+        let envelope: Value =
+            serde_json::from_str(tool_msg.content.as_deref().unwrap()).expect("tool envelope");
+        assert_eq!(envelope["tool"], "list_dir_tool");
+        assert_eq!(envelope["status"], "completed");
+        assert_eq!(envelope["input"]["path"], ".");
+        assert_eq!(envelope["output"], "src\nCargo.toml");
+        assert!(envelope["error"].is_null());
     }
 
     #[tokio::test]
@@ -743,6 +676,91 @@ mod tests {
             result.tool_results[0].result,
             "Unknown tool: missing_tool. Available: "
         );
+
+        let requests = model.requests.lock().await;
+        let second = &requests[1];
+        let tool_msg = second.iter().find(|m| m.role == "tool").expect("tool msg");
+        let envelope: Value =
+            serde_json::from_str(tool_msg.content.as_deref().unwrap()).expect("tool envelope");
+        assert_eq!(envelope["tool"], "missing_tool");
+        assert_eq!(envelope["status"], "failed");
+        assert_eq!(envelope["input"]["path"], "agent.py");
+        assert_eq!(envelope["error"]["code"], "tool_failed");
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown tool")
+        );
+        assert!(envelope["output"].is_null());
+    }
+
+    #[test]
+    fn structured_tool_errors_are_embedded_in_model_envelope() {
+        let exec = ToolExecution {
+            id: "call_1".to_owned(),
+            name: "patch_file_tool".to_owned(),
+            arguments: json!({"path": "notes.txt", "old_text": "missing"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+            result: json!({
+                "code": "patch_target_not_found",
+                "message": "Patch target not found in file",
+                "diagnostics": {
+                    "path": "notes.txt",
+                    "exact_occurrences": 0,
+                }
+            })
+            .to_string(),
+            error: true,
+        };
+
+        let envelope: Value =
+            serde_json::from_str(&model_tool_result_content(&exec)).expect("tool envelope");
+        assert_eq!(envelope["tool"], "patch_file_tool");
+        assert_eq!(envelope["status"], "failed");
+        assert_eq!(envelope["error"]["code"], "patch_target_not_found");
+        assert_eq!(
+            envelope["error"]["message"],
+            "Patch target not found in file"
+        );
+        assert_eq!(envelope["error"]["diagnostics"]["exact_occurrences"], 0);
+        assert!(envelope["output"].is_null());
+    }
+
+    #[tokio::test]
+    async fn skips_exact_repeated_failed_tool_call_after_two_attempts() {
+        let args = json!({"path": "notes.txt", "old_text": "missing", "new_text": "new"});
+        let model = MockModel::new(vec![
+            tool_call_response("call_1", "patch_file_tool", args.clone()),
+            tool_call_response("call_2", "patch_file_tool", args.clone()),
+            tool_call_response("call_3", "patch_file_tool", args),
+            text_response("Could not patch it."),
+        ]);
+        let tools = MockTools::with_outputs(HashMap::from([(
+            "patch_file_tool".to_owned(),
+            Err(anyhow!("Patch target not found in file")),
+        )]));
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Patch notes.txt.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(result.answer, "Could not patch it.");
+        assert_eq!(result.tool_results.len(), 3);
+        assert_eq!(
+            result.tool_results[2].result,
+            "Skipped repeated failed tool call with the same arguments. Re-read the relevant file/output and choose a different, smaller patch or another tool instead of retrying this call."
+        );
+        assert_eq!(tools.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -798,31 +816,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_file_change_claims_without_write_tool_result() {
-        let model = MockModel::new(vec![text_response(
-            "I implemented the retry mechanism in src/agent_loop.rs.",
-        )]);
-        let tools = MockTools::with_outputs(HashMap::new());
-
-        let result = run_agent_loop(
-            &model,
-            &[ConversationMessage::new("user", "Make the agent smarter.")],
-            &tools,
-            &[],
-            None,
-            AgentLoopOptions::default(),
-        )
-        .await
-        .expect("loop should succeed");
-
-        assert_eq!(
-            result.answer,
-            "I do not have a successful file-write tool result confirming that change."
-        );
-        assert!(result.tool_results.is_empty());
-    }
-
-    #[tokio::test]
     async fn allows_explanations_that_mention_code_changes_without_claiming_action() {
         let model = MockModel::new(vec![text_response(
             "The flow updates SessionState, records commands, and persists the response.",
@@ -846,28 +839,6 @@ mod tests {
         assert_eq!(
             result.answer,
             "The flow updates SessionState, records commands, and persists the response."
-        );
-    }
-
-    #[tokio::test]
-    async fn blocks_done_style_file_change_claims_without_write_tool_result() {
-        let model = MockModel::new(vec![text_response("Updated README.md.")]);
-        let tools = MockTools::with_outputs(HashMap::new());
-
-        let result = run_agent_loop(
-            &model,
-            &[ConversationMessage::new("user", "Update README.md.")],
-            &tools,
-            &[],
-            None,
-            AgentLoopOptions::default(),
-        )
-        .await
-        .expect("loop should succeed");
-
-        assert_eq!(
-            result.answer,
-            "I do not have a successful file-write tool result confirming that change."
         );
     }
 
@@ -926,7 +897,31 @@ Run `cargo test`.<tool_call|>"#,
 
         assert_eq!(
             result.answer,
-            "I tried to call a tool, but the tool call was malformed and could not be executed."
+            "I tried to call a tool, but the tool call was malformed and could not be executed. No tool action was completed."
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_dangling_tool_call_terminator_as_malformed() {
+        let model = MockModel::new(vec![text_response(
+            r#"call:patch_file_tool{path:"README.md"}<tool_call|>"#,
+        )]);
+        let tools = MockTools::with_outputs(HashMap::new());
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Patch README.md.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(
+            result.answer,
+            "I tried to call a tool, but the tool call was malformed and could not be executed. No tool action was completed."
         );
     }
 
@@ -958,36 +953,17 @@ Run `cargo test`.<tool_call|>"#,
     }
 
     #[tokio::test]
-    async fn blocks_test_pass_claims_without_command_result() {
-        let model = MockModel::new(vec![text_response("I ran cargo test, and tests passed.")]);
-        let tools = MockTools::with_outputs(HashMap::new());
-
-        let result = run_agent_loop(
-            &model,
-            &[ConversationMessage::new("user", "Change the code.")],
-            &tools,
-            &[],
-            None,
-            AgentLoopOptions::default(),
-        )
-        .await
-        .expect("loop should succeed");
-
-        assert_eq!(
-            result.answer,
-            "I do not have a successful command result confirming that tests passed."
-        );
-    }
-
-    #[tokio::test]
-    async fn blocks_test_pass_claims_after_nonzero_command_result() {
+    async fn failed_command_result_is_sent_to_model_as_structured_envelope() {
         let model = MockModel::new(vec![
             tool_call_response("call_1", "run_command_tool", json!({"cmd": "cargo test"})),
-            text_response("I ran cargo test, and tests passed."),
+            text_response("Tests failed."),
         ]);
         let tools = MockTools::with_outputs(HashMap::from([(
             "run_command_tool".to_owned(),
-            Ok("$ cargo test\n\nexit_code: 1\n\nstdout:\nfailed\n\nstderr:\n".to_owned()),
+            Ok(
+                "$ cargo test\n\nexit_code: 1\n\noutput (stdout+stderr merged by PTY):\nfailed"
+                    .to_owned(),
+            ),
         )]));
 
         let result = run_agent_loop(
@@ -1001,9 +977,21 @@ Run `cargo test`.<tool_call|>"#,
         .await
         .expect("loop should succeed");
 
-        assert_eq!(
-            result.answer,
-            "I do not have a successful command result confirming that tests passed."
+        assert_eq!(result.answer, "Tests failed.");
+
+        let requests = model.requests.lock().await;
+        let second = &requests[1];
+        let tool_msg = second.iter().find(|m| m.role == "tool").expect("tool msg");
+        let envelope: Value =
+            serde_json::from_str(tool_msg.content.as_deref().unwrap()).expect("tool envelope");
+        assert_eq!(envelope["tool"], "run_command_tool");
+        assert_eq!(envelope["status"], "completed");
+        assert_eq!(envelope["input"]["cmd"], "cargo test");
+        assert!(
+            envelope["output"]
+                .as_str()
+                .unwrap()
+                .contains("exit_code: 1")
         );
     }
 
@@ -1015,7 +1003,10 @@ Run `cargo test`.<tool_call|>"#,
         ]);
         let tools = MockTools::with_outputs(HashMap::from([(
             "run_command_tool".to_owned(),
-            Ok("$ cargo test\n\nexit_code: 0\n\nstdout:\nok\n\nstderr:\n".to_owned()),
+            Ok(
+                "$ cargo test\n\nexit_code: 0\n\noutput (stdout+stderr merged by PTY):\nok"
+                    .to_owned(),
+            ),
         )]));
 
         let result = run_agent_loop(
@@ -1034,14 +1025,21 @@ Run `cargo test`.<tool_call|>"#,
 
     #[test]
     fn system_prompt_has_key_rules() {
-        assert!(SYSTEM_PROMPT.contains("Max 3 read_file_tool calls per response"));
-        assert!(SYSTEM_PROMPT.contains("Never run build or test commands"));
-        assert!(SYSTEM_PROMPT.contains("answer from names only"));
         assert!(SYSTEM_PROMPT.contains("search_code_tool"));
+        assert!(SYSTEM_PROMPT.contains("Did you mean"));
+        assert!(SYSTEM_PROMPT.contains("concrete tokens from the user's requested boundary"));
+        assert!(SYSTEM_PROMPT.contains("broad prose labels"));
+        assert!(SYSTEM_PROMPT.contains("find_file_tool"));
+        assert!(SYSTEM_PROMPT.contains("HEALTH_SANDBOX/fixture-crate"));
         assert!(SYSTEM_PROMPT.contains("one sentence"));
         assert!(SYSTEM_PROMPT.contains("start_command_session_tool"));
         assert!(SYSTEM_PROMPT.contains("read_command_session_tool"));
-        assert!(SYSTEM_PROMPT.contains("something is slow"));
-        assert!(SYSTEM_PROMPT.contains("fix the thing from last time"));
+        assert!(SYSTEM_PROMPT.contains("clean up"));
+        assert!(SYSTEM_PROMPT.contains("patch_file_tool"));
+        assert!(SYSTEM_PROMPT.contains("exit code"));
+        assert!(SYSTEM_PROMPT.contains("## Flow Tracing"));
+        assert!(SYSTEM_PROMPT.contains("external entry point"));
+        assert!(SYSTEM_PROMPT.contains("start boundary and the end boundary"));
+        assert!(SYSTEM_PROMPT.contains("avoid hardcoding flow-specific function names"));
     }
 }

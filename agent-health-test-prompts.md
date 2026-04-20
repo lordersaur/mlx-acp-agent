@@ -105,9 +105,12 @@ Inspect this repo and explain the current ACP message flow from Zed session/prom
 ```
 
 Expected good behavior:
-- Uses `search_code_tool` to find specific functions before reading.
+- Uses `search_code_tool` with concrete source tokens from the requested boundaries before reading, not broad prose labels.
 - Does not read the same file twice in one turn.
 - References concrete files/functions from source, not docs alone.
+- Reads the function or block for each named hop in the final flow; search snippets alone do not count as proof.
+- Verifies source-read evidence for both the requested start boundary and end boundary.
+- If a relevant read is truncated before the requested boundary is visible, continues from the tool-provided continuation line instead of inferring the ending.
 - Tool panels show search/read output previews.
 - Does not modify files.
 

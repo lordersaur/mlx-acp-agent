@@ -32,7 +32,6 @@ const RUN_COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 struct CmdBuffer {
     data: String,
     read_offset: usize,
-    closed: bool,
 }
 
 impl CmdBuffer {
@@ -40,7 +39,6 @@ impl CmdBuffer {
         Self {
             data: String::new(),
             read_offset: 0,
-            closed: false,
         }
     }
 
@@ -163,7 +161,7 @@ pub fn run_command(
             persist_snapshot(&session, false, Some(exit_code))?;
             sessions.lock().unwrap().remove(&session_id);
             return Ok(format!(
-                "$ {cmd}\n\nexit_code: {exit_code}\n\nstdout:\n{output}\n\nstderr:\n"
+                "$ {cmd}\n\nexit_code: {exit_code}\n\noutput (stdout+stderr merged by PTY):\n{output}"
             ));
         }
 
@@ -174,7 +172,7 @@ pub fn run_command(
             };
             persist_snapshot(&session, true, None)?;
             return Ok(format!(
-                "$ {cmd}\n\nsession_id: {session_id}\n\nrunning: true\n\nstdout:\n{output}\n\nstderr:\n\n[command is still running in session `{session_id}`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]"
+                "$ {cmd}\n\nsession_id: {session_id}\n\nrunning: true\n\noutput (stdout+stderr merged by PTY):\n{output}\n\n[command is still running in session `{session_id}`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]"
             ));
         }
 
@@ -500,7 +498,6 @@ fn spawn_command_session(cwd: &Path, cmd: &str) -> Result<Arc<CmdSession>> {
                 }
             }
         }
-        buffer_for_thread.lock().unwrap().closed = true;
     });
 
     Ok(Arc::new(CmdSession {
@@ -724,7 +721,7 @@ mod tests {
         let output = run_command(&sessions, tempdir.path(), "printf 'hi'").expect("run command");
         assert_eq!(
             output,
-            "$ printf 'hi'\n\nexit_code: 0\n\nstdout:\nhi\n\nstderr:\n"
+            "$ printf 'hi'\n\nexit_code: 0\n\noutput (stdout+stderr merged by PTY):\nhi"
         );
         assert!(sessions.lock().unwrap().is_empty());
     }
