@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
+use crate::model_parser::extract_thought_blocks;
 
 // ---------------------------------------------------------------------------
 // Wire-format message types
@@ -204,14 +205,14 @@ impl MlxClient {
                 .iter()
                 .filter_map(ApiToolCall::from_chat)
                 .collect();
-            let text = normalize_content(msg.content).trim().to_owned();
+            let text = clean_model_text(&normalize_content(msg.content));
             return Ok(CompletionResult {
                 content: if text.is_empty() { None } else { Some(text) },
                 tool_calls: api_calls,
             });
         }
 
-        let text = normalize_content(msg.content).trim().to_owned();
+        let text = clean_model_text(&normalize_content(msg.content));
         Ok(CompletionResult {
             content: if text.is_empty() { None } else { Some(text) },
             tool_calls: Vec::new(),
@@ -303,24 +304,14 @@ impl MlxClient {
             }
         }
 
-        // Strip think tags so agent_loop doesn't double-emit them.
-        let content = extract_post_think(&full_text);
+        let content = clean_model_text(&full_text);
 
         if !tool_calls_final.is_empty() {
             let api_calls = tool_calls_final
                 .iter()
                 .filter_map(ApiToolCall::from_chat)
                 .collect();
-            // Keep only pre-tool-call text; strip both Qwen (<tool_call>) and
-            // Gemma (<|tool_call>) markers so raw token strings don't surface as thoughts.
-            let cut = [content.find("<tool_call>"), content.find("<|tool_call>")]
-                .into_iter()
-                .flatten()
-                .min();
-            let text = match cut {
-                Some(idx) => content[..idx].trim().to_owned(),
-                None => content,
-            };
+            let text = strip_tool_call_artifacts(&content);
             return Ok(CompletionResult {
                 content: if text.is_empty() { None } else { Some(text) },
                 tool_calls: api_calls,
@@ -354,6 +345,7 @@ enum ThinkState {
 /// Handles four patterns:
 /// - Qwen explicit: `<think>…content…</think>`
 /// - Qwen pre-filled: `…content…</think>` (open tag is in the prompt, not the output)
+/// - Gemma explicit: `<|think|>…content…<|/think|>`
 /// - Gemma explicit: `<|channel>thought\n…content…<channel|>`
 /// - Gemma pre-filled: `…content…<channel|>`
 fn stream_think_chunk(
@@ -363,7 +355,9 @@ fn stream_think_chunk(
     tx: &mpsc::UnboundedSender<String>,
 ) {
     const OPEN_THINK: &str = "<think>";
+    const OPEN_GEMMA_THINK: &str = "<|think|>";
     const CLOSE_THINK: &str = "</think>";
+    const CLOSE_GEMMA_THINK: &str = "<|/think|>";
     const OPEN_CHANNEL: &str = "<|channel>thought";
     const CLOSE_CHANNEL: &str = "<channel|>";
 
@@ -371,30 +365,10 @@ fn stream_think_chunk(
     loop {
         match state {
             ThinkState::Before => {
-                let close_think = buf.find(CLOSE_THINK);
-                let open_think = buf.find(OPEN_THINK);
-                let close_channel = buf.find(CLOSE_CHANNEL);
-                let open_channel = buf.find(OPEN_CHANNEL);
-
-                // Pick the earliest close tag across both model families.
-                let earliest_close = match (close_think, close_channel) {
-                    (Some(a), Some(b)) => {
-                        Some((a.min(b), if a <= b { CLOSE_THINK } else { CLOSE_CHANNEL }))
-                    }
-                    (Some(a), None) => Some((a, CLOSE_THINK)),
-                    (None, Some(b)) => Some((b, CLOSE_CHANNEL)),
-                    (None, None) => None,
-                };
-
-                // Pick the earliest open tag across both model families.
-                let earliest_open = match (open_think, open_channel) {
-                    (Some(a), Some(b)) => {
-                        Some((a.min(b), if a <= b { OPEN_THINK } else { OPEN_CHANNEL }))
-                    }
-                    (Some(a), None) => Some((a, OPEN_THINK)),
-                    (None, Some(b)) => Some((b, OPEN_CHANNEL)),
-                    (None, None) => None,
-                };
+                let earliest_close =
+                    earliest_tag(&buf, &[CLOSE_THINK, CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
+                let earliest_open =
+                    earliest_tag(&buf, &[OPEN_THINK, OPEN_GEMMA_THINK, OPEN_CHANNEL]);
 
                 let pre_filled = earliest_close.map_or(false, |(ci, _)| {
                     earliest_open.map_or(true, |(oi, _)| ci <= oi)
@@ -411,10 +385,7 @@ fn stream_think_chunk(
                     break;
                 } else if let Some((oi, open_tag)) = earliest_open {
                     *buf = buf[oi + open_tag.len()..].to_owned();
-                    // Gemma open tag is followed by a newline before actual content.
-                    if open_tag == OPEN_CHANNEL && buf.starts_with('\n') {
-                        buf.drain(..1);
-                    }
+                    strip_leading_newlines(buf);
                     *state = ThinkState::Inside;
                     // loop: check if close tag is already in buf
                 } else {
@@ -429,16 +400,7 @@ fn stream_think_chunk(
             }
             ThinkState::Inside => {
                 // Accept either close tag inside a thinking block.
-                let think_close = buf.find(CLOSE_THINK);
-                let channel_close = buf.find(CLOSE_CHANNEL);
-                let close = match (think_close, channel_close) {
-                    (Some(a), Some(b)) => {
-                        Some((a.min(b), if a <= b { CLOSE_THINK } else { CLOSE_CHANNEL }))
-                    }
-                    (Some(a), None) => Some((a, CLOSE_THINK)),
-                    (None, Some(b)) => Some((b, CLOSE_CHANNEL)),
-                    (None, None) => None,
-                };
+                let close = earliest_tag(&buf, &[CLOSE_THINK, CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
                 if let Some((idx, tag)) = close {
                     let before_close = buf[..idx].to_owned();
                     if !before_close.is_empty() {
@@ -467,13 +429,48 @@ fn stream_think_chunk(
 }
 
 /// Return the text that follows the thinking closing tag (the actual answer).
+#[allow(dead_code)]
 fn extract_post_think(text: &str) -> String {
-    for tag in &["</think>", "</thinking>", "<channel|>"] {
-        if let Some(idx) = text.find(tag) {
-            return text[idx + tag.len()..].trim().to_owned();
+    clean_model_text(text)
+}
+
+fn clean_model_text(text: &str) -> String {
+    let (_, cleaned) = extract_thought_blocks(text);
+    cleaned.trim().to_owned()
+}
+
+fn strip_tool_call_artifacts(text: &str) -> String {
+    let cut = [
+        text.find("<tool_call>"),
+        text.find("<|tool_call>"),
+        text.find("<tool_call|>"),
+        text.find("<|tool_call|>"),
+        text.find("call:"),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+
+    match cut {
+        Some(idx) => text[..idx].trim().to_owned(),
+        None => text.trim().to_owned(),
+    }
+}
+
+fn earliest_tag<'a>(text: &str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|tag| text.find(tag).map(|idx| (idx, *tag)))
+        .min_by_key(|(idx, _)| *idx)
+}
+
+fn strip_leading_newlines(buf: &mut String) {
+    while let Some(first) = buf.chars().next() {
+        if first == '\n' || first == '\r' {
+            buf.drain(..first.len_utf8());
+        } else {
+            break;
         }
     }
-    text.trim().to_owned()
 }
 
 fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
@@ -542,5 +539,53 @@ fn value_to_string(value: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::Array(_) | Value::Object(_) => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThinkState, clean_model_text, stream_think_chunk};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn clean_model_text_strips_gemma_thought_tokens() {
+        let raw = "<|think|>reasoning<|/think|>final answer";
+        assert_eq!(clean_model_text(raw), "final answer");
+    }
+
+    #[test]
+    fn stream_think_chunk_handles_gemma_channel_thoughts() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = ThinkState::Before;
+        let mut buf = String::new();
+
+        stream_think_chunk(
+            &mut state,
+            &mut buf,
+            "<|channel>thought\nI will inspect",
+            &tx,
+        );
+        stream_think_chunk(&mut state, &mut buf, "\n<channel|>The answer.", &tx);
+
+        let mut thought = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            thought.push_str(&chunk);
+        }
+
+        assert_eq!(thought.trim_end(), "I will inspect");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_think_chunk_handles_gemma_think_token_pair() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = ThinkState::Before;
+        let mut buf = String::new();
+
+        stream_think_chunk(&mut state, &mut buf, "<|think|>reason", &tx);
+        stream_think_chunk(&mut state, &mut buf, "ing<|/think|>final", &tx);
+
+        assert_eq!(rx.try_recv().unwrap(), "reasoning");
+        assert!(rx.try_recv().is_err());
     }
 }

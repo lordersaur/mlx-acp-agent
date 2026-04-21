@@ -798,7 +798,11 @@ fn looks_like_file_content(instruction: &str) -> bool {
 fn sanitize_generated_file_content(text: &str) -> String {
     let mut cleaned = text.replace("<|im_end|>", "").replace("<|im_start|>", "");
 
-    for (open, close) in [("<thinking>", "</thinking>"), ("<think>", "</think>")] {
+    for (open, close) in [
+        ("<thinking>", "</thinking>"),
+        ("<think>", "</think>"),
+        ("<|think|>", "<|/think|>"),
+    ] {
         while let Some(start) = cleaned.find(open) {
             if let Some(end_rel) = cleaned[start + open.len()..].find(close) {
                 let end = start + open.len() + end_rel + close.len();
@@ -813,7 +817,10 @@ fn sanitize_generated_file_content(text: &str) -> String {
     let balanced_channel_re = Regex::new(r"(?s)<\|channel>[^\n]*\n.*?<channel\|>").unwrap();
     cleaned = balanced_channel_re.replace_all(&cleaned, "").into_owned();
 
-    let drop_channel_lines = Regex::new(r"(?m)^\s*(?:<\|channel>|<channel\|>).*$").unwrap();
+    let drop_channel_lines = Regex::new(
+        r"(?m)^\s*(?:<\|channel>thought|<\|channel>|<channel\|>|<\|turn\|>|<turn\|>|</turn>).*$",
+    )
+    .unwrap();
     cleaned = drop_channel_lines.replace_all(&cleaned, "").into_owned();
 
     while let Some(start) = cleaned.find("<|channel>") {
@@ -826,7 +833,19 @@ fn sanitize_generated_file_content(text: &str) -> String {
         }
     }
 
-    cleaned = cleaned.replace("<channel|>", "").replace("<|channel>", "");
+    cleaned = cleaned
+        .replace("<channel|>", "")
+        .replace("<|channel>", "")
+        .replace("<|channel>thought", "")
+        .replace("<|think|>", "")
+        .replace("<|/think|>", "")
+        .replace("<think>", "")
+        .replace("</think>", "")
+        .replace("<thinking>", "")
+        .replace("</thinking>", "")
+        .replace("<|turn|>", "")
+        .replace("<turn|>", "")
+        .replace("</turn>", "");
 
     let has_trailing_newline = cleaned.ends_with('\n');
     let cleaned = cleaned.trim().to_owned();
@@ -1439,6 +1458,8 @@ plan first
 <|channel>thought
 This should not be written.
 <channel|>
+<|think|>hidden<|/think|>
+<|turn|>
 # Title
 
 Body text.

@@ -246,12 +246,13 @@ Falls back to local `run_command_tool` if any step fails.
   scanner so nested `{}` inside patch strings do not break extraction.
 - `<|"|>...<|"|>` delimited Gemma argument values preserve literal `\n` / `\t` / `\r`
   source escapes. Regular quoted values still decode control escapes.
-- `clean_output` removes `<think>`, `<|channel>thought`, `<turn|>`, and stray channel tokens
-  before tool-call extraction/final output.
+- `clean_output` removes `<think>`, `<|think|>`, `<|channel>thought`, `</thinking>`,
+  `<|turn|>`, and stray channel tokens before tool-call extraction/final output.
 - Qwen-style models use `<think>…</think>` tags with pre-filled thinking:
   `apply_chat_template` with `enable_thinking=True` injects `<think>\n` into the generation prompt
 - `stream_think_chunk` in `mlx_client.rs` handles the "pre-filled" thinking pattern
-- `extract_post_think` in `mlx_client.rs` strips everything up to `</think>` or `</thinking>` before returning the answer
+  for `<think>`, `<|think|>`, and Gemma channel tags.
+- `extract_post_think` in `mlx_client.rs` delegates to the shared thought-stripper before returning the answer
 - Tool call extraction in `main.py`: `gemma_native` first, then XML/compact fallbacks
   (`standard_xml_json`, `xml_function_parameters`, `qwen_hybrid_json`, `qwen_compact_native`)
 - Template fallback order: drop `enable_thinking` first (keeps tools), then drop `tools` if still failing

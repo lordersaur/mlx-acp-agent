@@ -10,14 +10,16 @@ use crate::model_parser::extract_thought_blocks;
 
 pub const SYSTEM_PROMPT: &str = "\
 You are a coding agent inside the user's editor.
-Ground all claims in code evidence via tools.
+Use tools to ground source-backed, code-backed, or current-fact claims.
 
 Rules:
-- Do not narrate or plan. Act immediately.
-- Start with concrete symbols, dispatch entries, or store functions.
-- Avoid semantic phrase searches. Use code tokens.
-- One small grounded action per turn.
-- Be concise. Cite exact file/function names in the final answer.
+- Take one grounded action per turn.
+- Start from concrete symbols, dispatch entries, stores, or file paths.
+- Use exact code tokens when searching or editing.
+- Give a concise final answer with exact file and function names when relevant.
+- Keep internal reasoning private.
+- Do not claim success until tool results confirm the change.
+- Use plain text arrows like -> instead of LaTeX.
 ";
 // ---------------------------------------------------------------------------
 // Public types
@@ -304,6 +306,8 @@ fn prevent_malformed_tool_call_answer(answer: String) -> String {
     if answer.contains("<|tool_call>")
         || answer.contains("<tool_call>")
         || answer.contains("<tool_call|>")
+        || answer.contains("<|tool_call|>")
+        || contains_raw_gemma_call_marker(&answer)
     {
         return "I tried to call a tool, but the tool call was malformed and could not be executed. No tool action was completed."
             .to_owned();
@@ -312,6 +316,11 @@ fn prevent_malformed_tool_call_answer(answer: String) -> String {
     answer
         .replace("$\\rightarrow$", "->")
         .replace("$\\to$", "->")
+}
+
+fn contains_raw_gemma_call_marker(answer: &str) -> bool {
+    let marker_re = regex::Regex::new(r"(?s)\bcall:[A-Za-z_][A-Za-z0-9_.-]*\s*\{").unwrap();
+    marker_re.is_match(answer)
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,21 +1034,14 @@ Run `cargo test`.<tool_call|>"#,
 
     #[test]
     fn system_prompt_has_key_rules() {
-        assert!(SYSTEM_PROMPT.contains("search_code_tool"));
-        assert!(SYSTEM_PROMPT.contains("Did you mean"));
-        assert!(SYSTEM_PROMPT.contains("concrete tokens from the user's requested boundary"));
-        assert!(SYSTEM_PROMPT.contains("broad prose labels"));
-        assert!(SYSTEM_PROMPT.contains("find_file_tool"));
-        assert!(SYSTEM_PROMPT.contains("HEALTH_SANDBOX/fixture-crate"));
-        assert!(SYSTEM_PROMPT.contains("one sentence"));
-        assert!(SYSTEM_PROMPT.contains("start_command_session_tool"));
-        assert!(SYSTEM_PROMPT.contains("read_command_session_tool"));
-        assert!(SYSTEM_PROMPT.contains("clean up"));
-        assert!(SYSTEM_PROMPT.contains("patch_file_tool"));
-        assert!(SYSTEM_PROMPT.contains("exit code"));
-        assert!(SYSTEM_PROMPT.contains("## Flow Tracing"));
-        assert!(SYSTEM_PROMPT.contains("external entry point"));
-        assert!(SYSTEM_PROMPT.contains("start boundary and the end boundary"));
-        assert!(SYSTEM_PROMPT.contains("avoid hardcoding flow-specific function names"));
+        assert!(SYSTEM_PROMPT.contains("coding agent inside the user's editor"));
+        assert!(SYSTEM_PROMPT.contains("Use tools to ground source-backed"));
+        assert!(SYSTEM_PROMPT.contains("Take one grounded action per turn"));
+        assert!(SYSTEM_PROMPT.contains("exact code tokens"));
+        assert!(SYSTEM_PROMPT.contains("concise final answer"));
+        assert!(
+            SYSTEM_PROMPT.contains("Do not claim success until tool results confirm the change")
+        );
+        assert!(SYSTEM_PROMPT.contains("Use plain text arrows like -> instead of LaTeX"));
     }
 }
