@@ -61,7 +61,7 @@ src/
 | Ask | Read-only — answers questions and inspects code |
 | Edit | File changes only — read, patch, create |
 | Agent | Full mode — search, web, shell, edits, validation |
-| Fast | Agent mode with thinking disabled (`/no_think`) — faster responses |
+| Fast | Agent mode with Gemma thinking disabled — faster responses |
 
 ## Config
 
@@ -211,9 +211,10 @@ facts and decide whether to retry, switch tools, or stop. Avoid English phrase-l
 guardrails that rewrite final answers.
 
 ### Fast mode / thinking toggle
-When mode is `fast`, `build_messages` in `acp.rs` prepends `/no_think` to the system message.
-`main.py` detects this and passes `enable_thinking=False` to `apply_chat_template`, skipping
-the `<think>` block entirely. Switching back to `agent` mode re-enables thinking.
+When mode is `fast`, `build_messages` in `acp.rs` adds `mode_prompt: fast` to the system
+message. `mlx_client.rs` sends `extra_body.enable_thinking=false`, and `main.py` also detects
+the marker before calling `apply_chat_template`. For non-fast modes, `main.py` prepends
+Gemma's `<|think|>` system token and requests `enable_thinking=true`.
 
 ### ACP terminal support (Phase 9)
 When Zed advertises `clientCapabilities.terminal = true`, `run_command_tool` routes
@@ -239,30 +240,33 @@ Falls back to local `run_command_tool` if any step fails.
   `Search run_agent_loop in src/agent_loop.rs`.
 
 ### Model tool calling (main.py)
-- `MODEL_FAMILY` switches behavior: Gemma gets native `role: "tool"` messages with
-  `tool_call_id`; non-Gemma models still receive `role: "user"` with `<tool_response>`.
+- Gemma receives tool results as `tool_responses` attached to the preceding assistant
+  `tool_calls` message.
 - `arguments` in tool_calls are parsed from JSON string to dict before the template sees them
-- Gemma-native `<|tool_call>call:name{args}<tool_call|>` calls are parsed by a brace-counting
-  scanner so nested `{}` inside patch strings do not break extraction.
+- Gemma-native tool calls follow the official Gemma 4 token pair:
+  `<|tool_call>call:name{args}<tool_call|>`. The MLX server parser may also accept
+  legacy local variants for compatibility, but new docs and tests should use the
+  canonical `<|tool_call>` opening token.
+- Gemma requests use the documented sampling defaults: `temperature=1.0`, `top_p=0.95`,
+  and `top_k=64`.
 - `<|"|>...<|"|>` delimited Gemma argument values preserve literal `\n` / `\t` / `\r`
   source escapes. Regular quoted values still decode control escapes.
-- `clean_output` removes `<think>`, `<|think|>`, `<|channel>thought`, `</thinking>`,
-  `<|turn|>`, and stray channel tokens before tool-call extraction/final output.
-- Qwen-style models use `<think>…</think>` tags with pre-filled thinking:
-  `apply_chat_template` with `enable_thinking=True` injects `<think>\n` into the generation prompt
+- `clean_output` removes `<|think|>`, `<|channel>thought`, `<|turn|>`, and stray channel
+  tokens before tool-call extraction/final output.
 - `stream_think_chunk` in `mlx_client.rs` handles the "pre-filled" thinking pattern
-  for `<think>`, `<|think|>`, and Gemma channel tags.
+  for `<|think|>` and Gemma channel tags.
 - `extract_post_think` in `mlx_client.rs` delegates to the shared thought-stripper before returning the answer
-- Tool call extraction in `main.py`: `gemma_native` first, then XML/compact fallbacks
-  (`standard_xml_json`, `xml_function_parameters`, `qwen_hybrid_json`, `qwen_compact_native`)
-- Template fallback order: drop `enable_thinking` first (keeps tools), then drop `tools` if still failing
+- Tool call extraction in `main.py`: `gemma_native`
+- Template fallback order: drop `enable_thinking` first (the system `<|think|>` token still
+  controls Gemma thinking), then drop `tools` if still failing
 
 ### Gemma 4 System Prompt Optimization
 Gemma 4 community tips for improved instruction adherence, especially with OptiQ 4-bit quantization:
 
 - **Positive Rules:** Gemma 4 prioritizes positive instructions over negative ones. Instead of "Never answer from memory," use "Always use tools to gather information."
-- **Context "Pull" Mitigation:** As the context window fills, the model prioritizes recent user tokens over system rules. `build_messages` in `acp.rs` automatically appends a rule reminder to the user's prompt after 5 turns.
-- **Brevity:** Keep the system prompt short and absolute (under 500 words). Avoid complex "persona" descriptions.
+- **Context "Pull" Mitigation:** `build_messages` in `acp.rs` keeps `SYSTEM_PROMPT` short and wraps the current task in a Gemma-style user instruction block with rules, task, and required output format.
+- **Read Completion:** The user wrapper tells the model to continue truncated file reads before explaining a file.
+- **Brevity:** Keep the system prompt short and absolute. Put critical task rules close to the current user task.
 - **No LaTeX:** Use plain text arrows (`->`) as Gemma 4 sometimes hallucinates LaTeX formatting (`$\rightarrow$`) which breaks ACP parsing.
 
 ### Context truncation (main.py)

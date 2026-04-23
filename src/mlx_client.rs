@@ -173,7 +173,9 @@ impl MlxClient {
             messages: messages.to_vec(),
             max_tokens,
             temperature,
+            top_p: Some(0.95),
             tools: tools_field,
+            extra_body: Some(gemma4_extra_body(messages)),
         };
 
         let response = self
@@ -219,7 +221,7 @@ impl MlxClient {
         })
     }
 
-    /// Streaming variant: yields `<think>` tokens to `think_tx` as they arrive,
+    /// Streaming variant: yields Gemma thinking tokens to `think_tx` as they arrive,
     /// then returns the full CompletionResult (with think tags stripped from content).
     pub async fn complete_streaming(
         &self,
@@ -228,6 +230,7 @@ impl MlxClient {
         max_tokens: u32,
         temperature: f32,
         think_tx: mpsc::UnboundedSender<String>,
+        answer_tx: Option<mpsc::UnboundedSender<String>>,
     ) -> Result<CompletionResult> {
         let tools_field = if tools.is_empty() {
             None
@@ -241,7 +244,9 @@ impl MlxClient {
             messages: messages.to_vec(),
             max_tokens,
             temperature,
+            top_p: Some(0.95),
             tools: tools_field,
+            extra_body: Some(gemma4_extra_body(messages)),
         };
 
         let response = self
@@ -257,8 +262,8 @@ impl MlxClient {
         let mut byte_stream = response.bytes_stream();
         let mut full_text = String::new();
         let mut tool_calls_final: Vec<ChatToolCall> = Vec::new();
-        let mut think_state = ThinkState::Before;
-        let mut tag_buf = String::new();
+        let mut content_stream = ContentStreamState::default();
+        let mut answer_stream = AnswerStreamState::default();
 
         while let Some(item) = byte_stream.next().await {
             let bytes = item.context("error reading SSE stream")?;
@@ -288,7 +293,18 @@ impl MlxClient {
                     if let Some(content) = delta["content"].as_str() {
                         if !content.is_empty() {
                             full_text.push_str(content);
-                            stream_think_chunk(&mut think_state, &mut tag_buf, content, &think_tx);
+                            for event in stream_content_chunk(&mut content_stream, content) {
+                                match event {
+                                    StreamEvent::Thought(chunk) => {
+                                        think_tx.send(chunk).ok();
+                                    }
+                                    StreamEvent::Answer(chunk) => {
+                                        if let Some(ref tx) = answer_tx {
+                                            stream_answer_chunk(&mut answer_stream, &chunk, tx);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -307,15 +323,33 @@ impl MlxClient {
         let content = clean_model_text(&full_text);
 
         if !tool_calls_final.is_empty() {
+            for event in finish_content_stream(&mut content_stream) {
+                if let StreamEvent::Thought(chunk) = event {
+                    think_tx.send(chunk).ok();
+                }
+            }
+
             let api_calls = tool_calls_final
                 .iter()
                 .filter_map(ApiToolCall::from_chat)
                 .collect();
-            let text = strip_tool_call_artifacts(&content);
             return Ok(CompletionResult {
-                content: if text.is_empty() { None } else { Some(text) },
+                content: if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                },
                 tool_calls: api_calls,
             });
+        }
+
+        if let Some(ref tx) = answer_tx {
+            for event in finish_content_stream(&mut content_stream) {
+                if let StreamEvent::Answer(chunk) = event {
+                    stream_answer_chunk(&mut answer_stream, &chunk, tx);
+                }
+            }
+            flush_answer_stream(&mut answer_stream, tx);
         }
 
         Ok(CompletionResult {
@@ -339,36 +373,49 @@ enum ThinkState {
     After,
 }
 
+impl Default for ThinkState {
+    fn default() -> Self {
+        Self::Before
+    }
+}
+
+#[derive(Default)]
+struct ContentStreamState {
+    thought: ThinkState,
+    buf: String,
+}
+
+#[derive(Default)]
+struct AnswerStreamState {
+    buf: String,
+}
+
+enum StreamEvent {
+    Thought(String),
+    Answer(String),
+}
+
 /// Feed a delta token into the think state machine.
-/// Sends content that falls inside a thinking block to `tx`.
+/// Splits content into thinking chunks and visible-answer chunks.
 ///
-/// Handles four patterns:
-/// - Qwen explicit: `<think>…content…</think>`
-/// - Qwen pre-filled: `…content…</think>` (open tag is in the prompt, not the output)
+/// Handles Gemma thinking patterns:
 /// - Gemma explicit: `<|think|>…content…<|/think|>`
 /// - Gemma explicit: `<|channel>thought\n…content…<channel|>`
 /// - Gemma pre-filled: `…content…<channel|>`
-fn stream_think_chunk(
-    state: &mut ThinkState,
-    buf: &mut String,
-    content: &str,
-    tx: &mpsc::UnboundedSender<String>,
-) {
-    const OPEN_THINK: &str = "<think>";
+fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<StreamEvent> {
     const OPEN_GEMMA_THINK: &str = "<|think|>";
-    const CLOSE_THINK: &str = "</think>";
     const CLOSE_GEMMA_THINK: &str = "<|/think|>";
     const OPEN_CHANNEL: &str = "<|channel>thought";
     const CLOSE_CHANNEL: &str = "<channel|>";
+    const MAX_TAG_LEN: usize = OPEN_CHANNEL.len();
 
-    buf.push_str(content);
+    let mut events = Vec::new();
+    state.buf.push_str(content);
     loop {
-        match state {
+        match state.thought {
             ThinkState::Before => {
-                let earliest_close =
-                    earliest_tag(&buf, &[CLOSE_THINK, CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
-                let earliest_open =
-                    earliest_tag(&buf, &[OPEN_THINK, OPEN_GEMMA_THINK, OPEN_CHANNEL]);
+                let earliest_close = earliest_tag(&state.buf, &[CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
+                let earliest_open = earliest_tag(&state.buf, &[OPEN_GEMMA_THINK, OPEN_CHANNEL]);
 
                 let pre_filled = earliest_close.map_or(false, |(ci, _)| {
                     earliest_open.map_or(true, |(oi, _)| ci <= oi)
@@ -376,54 +423,103 @@ fn stream_think_chunk(
 
                 if pre_filled {
                     let (ci, close_tag) = earliest_close.unwrap();
-                    let thinking = buf[..ci].trim().to_owned();
+                    let thinking = state.buf[..ci].trim().to_owned();
                     if !thinking.is_empty() {
-                        tx.send(thinking).ok();
+                        events.push(StreamEvent::Thought(thinking));
                     }
-                    *buf = buf[ci + close_tag.len()..].to_owned();
-                    *state = ThinkState::After;
-                    break;
+                    let answer = state.buf[ci + close_tag.len()..].to_owned();
+                    state.buf.clear();
+                    state.thought = ThinkState::After;
+                    if !answer.is_empty() {
+                        events.push(StreamEvent::Answer(answer));
+                    }
                 } else if let Some((oi, open_tag)) = earliest_open {
-                    *buf = buf[oi + open_tag.len()..].to_owned();
-                    strip_leading_newlines(buf);
-                    *state = ThinkState::Inside;
+                    let prefix = state.buf[..oi].to_owned();
+                    if !prefix.is_empty() {
+                        events.push(StreamEvent::Answer(prefix));
+                    }
+                    state.buf = state.buf[oi + open_tag.len()..].to_owned();
+                    strip_leading_channel_separator(&mut state.buf);
+                    state.thought = ThinkState::Inside;
                     // loop: check if close tag is already in buf
                 } else {
-                    // Neither tag seen yet — buffer and wait.
-                    // If buffer grows too large the model isn't doing thinking (Fast mode).
-                    if buf.len() > 4096 {
-                        *state = ThinkState::After;
-                        buf.clear();
+                    // Preserve a small suffix in case a Gemma tag is split across chunks.
+                    let safe = state.buf.len().saturating_sub(MAX_TAG_LEN - 1);
+                    let safe = floor_char_boundary(&state.buf, safe);
+                    if safe > 0 {
+                        events.push(StreamEvent::Answer(state.buf[..safe].to_owned()));
+                        state.buf.drain(..safe);
                     }
                     break;
                 }
             }
             ThinkState::Inside => {
-                // Accept either close tag inside a thinking block.
-                let close = earliest_tag(&buf, &[CLOSE_THINK, CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
+                let close = earliest_tag(&state.buf, &[CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
                 if let Some((idx, tag)) = close {
-                    let before_close = buf[..idx].to_owned();
+                    let before_close = state.buf[..idx].to_owned();
                     if !before_close.is_empty() {
-                        tx.send(before_close).ok();
+                        events.push(StreamEvent::Thought(before_close));
                     }
-                    *buf = buf[idx + tag.len()..].to_owned();
-                    *state = ThinkState::After;
-                    break;
+                    let answer = state.buf[idx + tag.len()..].to_owned();
+                    state.buf.clear();
+                    state.thought = ThinkState::After;
+                    if !answer.is_empty() {
+                        events.push(StreamEvent::Answer(answer));
+                    }
                 } else {
                     // Flush all but the last 12 bytes (guards against a split close tag).
-                    let safe = buf.len().saturating_sub(12);
-                    let safe = floor_char_boundary(buf, safe);
+                    let safe = state.buf.len().saturating_sub(12);
+                    let safe = floor_char_boundary(&state.buf, safe);
                     if safe > 0 {
-                        tx.send(buf[..safe].to_owned()).ok();
-                        buf.drain(..safe);
+                        events.push(StreamEvent::Thought(state.buf[..safe].to_owned()));
+                        state.buf.drain(..safe);
                     }
                     break;
                 }
             }
             ThinkState::After => {
-                buf.clear();
+                if !state.buf.is_empty() {
+                    events.push(StreamEvent::Answer(std::mem::take(&mut state.buf)));
+                }
                 break;
             }
+        }
+    }
+    events
+}
+
+fn finish_content_stream(state: &mut ContentStreamState) -> Vec<StreamEvent> {
+    match state.thought {
+        ThinkState::Inside => {
+            if state.buf.is_empty() {
+                Vec::new()
+            } else {
+                vec![StreamEvent::Thought(std::mem::take(&mut state.buf))]
+            }
+        }
+        ThinkState::Before | ThinkState::After => {
+            if state.buf.is_empty() {
+                Vec::new()
+            } else {
+                vec![StreamEvent::Answer(std::mem::take(&mut state.buf))]
+            }
+        }
+    }
+}
+
+fn stream_answer_chunk(
+    state: &mut AnswerStreamState,
+    content: &str,
+    _tx: &mpsc::UnboundedSender<String>,
+) {
+    state.buf.push_str(content);
+}
+
+fn flush_answer_stream(state: &mut AnswerStreamState, tx: &mpsc::UnboundedSender<String>) {
+    if !state.buf.is_empty() {
+        let text = clean_model_text(&std::mem::take(&mut state.buf));
+        if !text.is_empty() {
+            tx.send(text).ok();
         }
     }
 }
@@ -439,33 +535,15 @@ fn clean_model_text(text: &str) -> String {
     cleaned.trim().to_owned()
 }
 
-fn strip_tool_call_artifacts(text: &str) -> String {
-    let cut = [
-        text.find("<tool_call>"),
-        text.find("<|tool_call>"),
-        text.find("<tool_call|>"),
-        text.find("<|tool_call|>"),
-        text.find("call:"),
-    ]
-    .into_iter()
-    .flatten()
-    .min();
-
-    match cut {
-        Some(idx) => text[..idx].trim().to_owned(),
-        None => text.trim().to_owned(),
-    }
-}
-
 fn earliest_tag<'a>(text: &str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
         .filter_map(|tag| text.find(tag).map(|idx| (idx, *tag)))
         .min_by_key(|(idx, _)| *idx)
 }
 
-fn strip_leading_newlines(buf: &mut String) {
+fn strip_leading_channel_separator(buf: &mut String) {
     while let Some(first) = buf.chars().next() {
-        if first == '\n' || first == '\r' {
+        if first == '\n' || first == '\r' || first == ' ' || first == '\t' {
             buf.drain(..first.len_utf8());
         } else {
             break;
@@ -491,8 +569,34 @@ struct CompletionRequest {
     messages: Vec<ChatMessage>,
     max_tokens: u32,
     temperature: f32,
+    top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_body: Option<Value>,
+}
+
+fn gemma4_extra_body(messages: &[ChatMessage]) -> Value {
+    let enable_thinking = !messages.iter().any(is_fast_mode_message);
+    serde_json::json!({
+        "top_k": 64,
+        "enable_thinking": enable_thinking,
+        "chat_template_kwargs": {
+            "enable_thinking": enable_thinking
+        }
+    })
+}
+
+fn is_fast_mode_message(message: &ChatMessage) -> bool {
+    message.role == "system"
+        && message
+            .content
+            .as_deref()
+            .map(|content| {
+                let lower = content.to_ascii_lowercase();
+                lower.contains("mode_prompt: fast") || lower.contains("current mode: fast.")
+            })
+            .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -544,7 +648,10 @@ fn value_to_string(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThinkState, clean_model_text, stream_think_chunk};
+    use super::{
+        AnswerStreamState, ContentStreamState, StreamEvent, clean_model_text,
+        finish_content_stream, flush_answer_stream, stream_answer_chunk, stream_content_chunk,
+    };
     use tokio::sync::mpsc;
 
     #[test]
@@ -554,38 +661,208 @@ mod tests {
     }
 
     #[test]
-    fn stream_think_chunk_handles_gemma_channel_thoughts() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = ThinkState::Before;
-        let mut buf = String::new();
-
-        stream_think_chunk(
-            &mut state,
-            &mut buf,
-            "<|channel>thought\nI will inspect",
-            &tx,
-        );
-        stream_think_chunk(&mut state, &mut buf, "\n<channel|>The answer.", &tx);
-
+    fn stream_content_chunk_handles_gemma_channel_thoughts_and_answer() {
+        let mut state = ContentStreamState::default();
         let mut thought = String::new();
-        while let Ok(chunk) = rx.try_recv() {
-            thought.push_str(&chunk);
+        let mut answer = String::new();
+
+        for event in stream_content_chunk(&mut state, "<|channel>thought\nI will inspect") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in stream_content_chunk(&mut state, "\n<channel|>The answer.") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in finish_content_stream(&mut state) {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
         }
 
         assert_eq!(thought.trim_end(), "I will inspect");
-        assert!(rx.try_recv().is_err());
+        assert_eq!(answer, "The answer.");
     }
 
     #[test]
-    fn stream_think_chunk_handles_gemma_think_token_pair() {
+    fn stream_content_chunk_handles_channel_thought_without_newline() {
+        let mut state = ContentStreamState::default();
+        let mut thought = String::new();
+        let mut answer = String::new();
+
+        for event in stream_content_chunk(
+            &mut state,
+            "<|channel>thought I will inspect.<channel|>The answer.",
+        ) {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in finish_content_stream(&mut state) {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+
+        assert_eq!(thought, "I will inspect.");
+        assert_eq!(answer, "The answer.");
+    }
+
+    #[test]
+    fn stream_content_chunk_handles_gemma_think_token_pair() {
+        let mut state = ContentStreamState::default();
+        let mut thought = String::new();
+        let mut answer = String::new();
+
+        for event in stream_content_chunk(&mut state, "<|think|>reason") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in stream_content_chunk(&mut state, "ing<|/think|>final") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in finish_content_stream(&mut state) {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+
+        assert_eq!(thought, "reasoning");
+        assert_eq!(answer, "final");
+    }
+
+    #[test]
+    fn stream_content_chunk_preserves_non_gemma_thinking_tags_as_answer() {
+        let mut state = ContentStreamState::default();
+        let mut thought = String::new();
+        let mut answer = String::new();
+
+        for event in stream_content_chunk(&mut state, "<thinking>inspect repo") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in stream_content_chunk(&mut state, "</thinking>Final.") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in finish_content_stream(&mut state) {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+
+        assert_eq!(thought, "");
+        assert_eq!(answer, "<thinking>inspect repo</thinking>Final.");
+    }
+
+    #[test]
+    fn stream_answer_chunk_preserves_tool_call_text() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = ThinkState::Before;
-        let mut buf = String::new();
+        let mut state = AnswerStreamState::default();
 
-        stream_think_chunk(&mut state, &mut buf, "<|think|>reason", &tx);
-        stream_think_chunk(&mut state, &mut buf, "ing<|/think|>final", &tx);
+        stream_answer_chunk(&mut state, "I will inspect. <|tool", &tx);
+        stream_answer_chunk(&mut state, "_call>call:read_file_tool{}", &tx);
+        flush_answer_stream(&mut state, &tx);
 
-        assert_eq!(rx.try_recv().unwrap(), "reasoning");
+        let mut answer = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            answer.push_str(&chunk);
+        }
+        assert_eq!(answer, "I will inspect. <|tool_call>call:read_file_tool{}");
+    }
+
+    #[test]
+    fn stream_answer_chunk_holds_short_answer_until_flush() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AnswerStreamState::default();
+
+        stream_answer_chunk(&mut state, "Final ", &tx);
+        stream_answer_chunk(&mut state, "answer.", &tx);
+
         assert!(rx.try_recv().is_err());
+
+        flush_answer_stream(&mut state, &tx);
+
+        let mut answer = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            answer.push_str(&chunk);
+        }
+        assert_eq!(answer, "Final answer.");
+    }
+
+    #[test]
+    fn stream_answer_flush_strips_gemma_channel_leak() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AnswerStreamState::default();
+
+        stream_answer_chunk(
+            &mut state,
+            "<|channel>thought\nThe user greeted us.<channel|>Hello! How can I help?",
+            &tx,
+        );
+        flush_answer_stream(&mut state, &tx);
+
+        let mut answer = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            answer.push_str(&chunk);
+        }
+        assert_eq!(answer, "Hello! How can I help?");
+    }
+
+    #[test]
+    fn stream_answer_chunk_buffers_long_answer_until_flush() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AnswerStreamState::default();
+        let long_answer = format!("{}{}", "a".repeat(600), " done");
+
+        stream_answer_chunk(&mut state, &long_answer, &tx);
+
+        assert!(rx.try_recv().is_err());
+
+        flush_answer_stream(&mut state, &tx);
+        let mut answer = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            answer.push_str(&chunk);
+        }
+        assert_eq!(answer, long_answer);
+    }
+
+    #[test]
+    fn gemma4_extra_body_disables_thinking_for_fast_mode_prompt() {
+        let messages = vec![super::ChatMessage::system(
+            "mode_prompt: fast\nCurrent mode: fast.",
+        )];
+
+        let body = super::gemma4_extra_body(&messages);
+        assert_eq!(body["top_k"], 64);
+        assert_eq!(body["enable_thinking"], false);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn gemma4_extra_body_enables_thinking_without_fast_mode_prompt() {
+        let messages = vec![super::ChatMessage::system("Current mode: agent.")];
+
+        let body = super::gemma4_extra_body(&messages);
+        assert_eq!(body["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
     }
 }

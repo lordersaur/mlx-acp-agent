@@ -5,8 +5,10 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
+use serde_json::json;
 
 pub const MAX_SEARCH_OUTPUT_CHARS: usize = 6000;
+pub const MAX_FIND_METADATA_FILES: usize = 50;
 pub const IGNORED_LIST_DIR_NAMES: &[&str] =
     &[".git", ".venv", "venv", "__pycache__", "site-packages"];
 
@@ -95,6 +97,7 @@ pub fn search_code(
 
     let mut rg_args = vec![
         "-n".to_owned(),
+        "--smart-case".to_owned(),
         "-C".to_owned(),
         "3".to_owned(),
         "--hidden".to_owned(),
@@ -123,7 +126,7 @@ pub fn search_code(
     let output = match Command::new("rg").args(&rg_args).output() {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Command::new("grep")
-            .args(["-R", "-n", query, &base.display().to_string()])
+            .args(["-R", "-i", "-n", query, &base.display().to_string()])
             .output()
             .context("failed to run grep fallback")?,
         Err(error) => return Err(error).context("failed to run rg"),
@@ -137,6 +140,20 @@ pub fn search_code(
     let code = output.status.code().unwrap_or(-1);
 
     if code != 0 && code != 1 {
+        if stderr.contains("regex parse error") {
+            return Ok(json!({
+                "code": "invalid_regex",
+                "message": "search_code_tool query is not a valid ripgrep regex",
+                "diagnostics": {
+                    "query": query,
+                    "glob": glob,
+                    "path": path,
+                    "stderr": stderr,
+                    "suggestion": "Use concrete symbols or escaped regex syntax; do not use wildcard-only queries like `*`."
+                }
+            })
+            .to_string());
+        }
         return Ok(format!("search failed\nstderr:\n{stderr}"));
     }
 
@@ -147,12 +164,13 @@ pub fn search_code(
     Ok(stdout)
 }
 
-pub fn find_files(cwd: &Path, pattern: &str) -> Result<String> {
+pub fn find_files(cwd: &Path, pattern: &str, include_metadata: bool) -> Result<String> {
     let base = cwd
         .canonicalize()
         .with_context(|| format!("failed to resolve workspace root {}", cwd.display()))?;
 
     let output = Command::new("rg")
+        .current_dir(&base)
         .args([
             "--files",
             "--hidden",
@@ -164,7 +182,7 @@ pub fn find_files(cwd: &Path, pattern: &str) -> Result<String> {
             "!**/__pycache__/**",
             "--glob",
             pattern,
-            base.to_str().unwrap_or("."),
+            ".",
         ])
         .output()
         .context("failed to run rg --files")?;
@@ -180,12 +198,49 @@ pub fn find_files(cwd: &Path, pattern: &str) -> Result<String> {
     let relative: Vec<String> = paths
         .iter()
         .map(|p| {
-            std::path::Path::new(p)
-                .strip_prefix(&base)
+            let path = std::path::Path::new(p);
+            path.strip_prefix(&base)
+                .or_else(|_| path.strip_prefix("."))
                 .map(|r| r.display().to_string())
-                .unwrap_or_else(|_| p.to_string())
+                .unwrap_or_else(|_| path.display().to_string())
         })
         .collect();
+
+    if include_metadata {
+        if relative.len() > MAX_FIND_METADATA_FILES {
+            return Ok(json!({
+                "pattern": pattern,
+                "metadata_included": false,
+                "metadata_omitted_reason": format!("matched {} files; metadata is only included for up to {} files", relative.len(), MAX_FIND_METADATA_FILES),
+                "files": relative,
+            })
+            .to_string());
+        }
+
+        let files = relative
+            .iter()
+            .map(|path| {
+                let absolute = base.join(path);
+                let size_bytes = fs::metadata(&absolute).ok().map(|m| m.len());
+                let line_count = fs::read_to_string(&absolute)
+                    .ok()
+                    .map(|content| content.lines().count());
+                json!({
+                    "path": path,
+                    "size_bytes": size_bytes,
+                    "line_count": line_count,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        return Ok(json!({
+            "pattern": pattern,
+            "metadata_included": true,
+            "files": files,
+            "hint": "Use line_count to choose targeted reads, larger read_file_tool limits, or consecutive reads. The default read_file_tool limit is one page, not whole-file evidence."
+        })
+        .to_string());
+    }
 
     Ok(relative.join("\n"))
 }
@@ -411,5 +466,39 @@ mod tests {
 
         let none = search_code(tempdir.path(), "gamma", Some("*.rs"), None).expect("search");
         assert_eq!(none, "No matches found.");
+    }
+
+    #[test]
+    fn search_code_uses_smart_case_for_lowercase_identifier_queries() {
+        let tempdir = TempDir::new().expect("tempdir");
+        fs::write(
+            tempdir.path().join("agent_loop.rs"),
+            "pub const SYSTEM_PROMPT: &str = \"hello\";\n",
+        )
+        .expect("write file");
+
+        let matches =
+            search_code(tempdir.path(), "system_prompt", Some("*.rs"), None).expect("search");
+        assert!(matches.contains("SYSTEM_PROMPT"), "{matches}");
+    }
+
+    #[test]
+    fn search_code_reports_invalid_regex_as_structured_json() {
+        let tempdir = TempDir::new().expect("tempdir");
+        fs::write(tempdir.path().join("lib.rs"), "fn alpha() {}\n").expect("write file");
+
+        let result = search_code(tempdir.path(), "*", Some("*.rs"), Some("lib.rs"))
+            .expect("invalid regex result");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("structured diagnostic json");
+
+        assert_eq!(parsed["code"], "invalid_regex");
+        assert_eq!(parsed["diagnostics"]["query"], "*");
+        assert!(
+            parsed["diagnostics"]["suggestion"]
+                .as_str()
+                .expect("suggestion")
+                .contains("wildcard-only")
+        );
     }
 }

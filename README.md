@@ -52,7 +52,7 @@ Then register the binary as an external agent pointing to `target/release/rust-a
 | Environment variable | Default | Description |
 |---|---|---|
 | `MLX_URL` | `http://127.0.0.1:8000/v1/chat/completions` | MLX server endpoint |
-| `MLX_MODEL` | `mlx-community/Qwen3.5-9B-OptiQ-4bit` | Model name reported to the server |
+| `MLX_MODEL` | `mlx-community/gemma-4-e4b-it-OptiQ-4bit` | Model name reported to the server |
 
 ## Modes
 

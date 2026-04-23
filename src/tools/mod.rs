@@ -94,13 +94,13 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "read_file_tool",
-                    "description": "Read a file from the workspace. Returns up to `limit` lines starting at line `start_line` (1-based). search_code_tool returns 1-based line numbers — pass them directly as start_line.\nIf output is truncated, the result is JSON with `content`, `truncated: true`, and `next_start_line`; continue from `next_start_line` when the current function/block or requested flow boundary is incomplete.\nNOTE: output lines are prefixed with `N: ` for display only — the actual file content does not contain these prefixes. Never include them in old_text when using patch_file_tool.",
+                    "description": "Read a file from the workspace. Returns up to `limit` lines starting at line `start_line` (1-based). Default `limit` is 200, but callers may request a larger limit when the user explicitly asks for a whole file or when a larger contiguous block is needed to understand the current function, file, or explanation boundary. For flow/lifecycle tasks, prefer search_code_tool first and read targeted regions instead of large whole-file reads.\nsearch_code_tool returns 1-based line numbers — pass them directly as start_line.\nIf output is truncated, the result is JSON with `complete: false`, `truncated: true`, `next_start_line`, and `remaining_lines`; continue from `next_start_line` when the current function/block/file or requested boundary is incomplete. Do not claim a whole file was read unless the returned output reaches end of file.\nNOTE: output lines are prefixed with `N: ` for display only — the actual file content does not contain these prefixes. Never include them in old_text when using patch_file_tool.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "Path to the file, relative to the workspace root."},
                             "start_line": {"type": "integer", "description": "1-based line number to start reading from (default 1)."},
-                            "limit": {"type": "integer", "description": "Max number of lines to return (default 200)."}
+                            "limit": {"type": "integer", "description": "Max number of lines to return (default 200). Use a larger value when a wider contiguous read is necessary for the task; otherwise keep reads targeted."}
                         },
                         "required": ["path"]
                     }
@@ -123,11 +123,11 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "search_code_tool",
-                    "description": "Search the workspace for symbols, function definitions, handlers, or RPC methods. Use this to ground your first search in concrete code tokens rather than broad prose.\n\n- Use `|` for multiple query alternatives: e.g. `handle_session_prompt|persist_session|ToolRegistry`.\n- Use `path` to scope to specific files or directories: e.g. `path: \"src/acp.rs\"` or `path: \"src/tools|src/acp.rs\"`.",
+                    "description": "Search file contents with ripgrep. Use for symbols, functions, handlers, route strings, or exact text inside files. Do not use for filename/path lookup; use find_file_tool for that. Results are candidates only; read files before code claims. Search snippets are not source-read evidence and do not count as having read a file.\n\n- Query must be valid ripgrep regex. Do not use wildcard-only queries like `*`; use concrete symbol patterns such as `fn|struct|impl`, function names, handlers, route strings, or escaped regex syntax.\n- Use `|` for multiple query alternatives: e.g. `handle_session_prompt|persist_session|ToolRegistry`.\n- Use `path` to scope content search to known files or directories: e.g. `path: \"src/acp.rs\"` or `path: \"src/tools|src/acp.rs\"`.\n- After search, call read_file_tool for each relevant function/block before citing it in a final answer.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Ripgrep query for code symbols, methods, or handlers. Use `|` for alternatives."},
+                            "query": {"type": "string", "description": "Valid ripgrep regex for code symbols, methods, handlers, or concrete strings inside files. Use `|` for alternatives. Do not use `path:foo.rs` or wildcard-only queries like `*`; use find_file_tool for filename lookup."},
                             "glob": {"type": "string", "description": "Optional glob filter (e.g. `*.rs`)."},
                             "path": {"type": "string", "description": "Optional path scope (e.g. `src/acp.rs`)."}
                         },
@@ -139,11 +139,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "find_file_tool",
-                    "description": "Find files in the workspace matching a glob pattern. Use this to discover file paths when you know the name or extension but not the full path.\n\nExamples: `**/*.rs`, `src/acp*`, `**/Cargo.toml`. The pattern may contain `|` for multiple alternatives, e.g. `src/acp.rs|src/agent_loop.rs`.",
+                    "description": "Find file paths by filename, path, extension, or glob. Use this, not search_code_tool, when locating files. Set `include_metadata: true` for small result sets when line counts or file sizes would help choose targeted reads, larger read_file_tool limits, or consecutive reads. Metadata is bounded and omitted for large result sets.\n\nExamples: `**/*.rs`, `src/acp*`, `**/Cargo.toml`. The pattern may contain `|` for multiple alternatives, e.g. `src/acp.rs|src/agent_loop.rs`.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "pattern": {"type": "string", "description": "Glob pattern to match files. Examples: `**/*.rs`, `src/acp*`, `**/Cargo.toml`, or `src/acp.rs|src/agent_loop.rs`."}
+                            "pattern": {"type": "string", "description": "Glob pattern to match files. Examples: `**/*.rs`, `src/acp*`, `**/Cargo.toml`, or `src/acp.rs|src/agent_loop.rs`."},
+                            "include_metadata": {"type": "boolean", "description": "When true, return JSON with path, size_bytes, and line_count for small result sets. Use this to decide read_file_tool limits; otherwise leave false for plain path output."}
                         },
                         "required": ["pattern"]
                     }
@@ -371,6 +372,9 @@ impl BuiltinToolRegistry {
 
     fn invoke_search_code(&self, arguments: Map<String, Value>) -> Result<String> {
         let query = required_string(&arguments, "query")?;
+        if let Some(diagnostic) = search_code_wrong_tool_diagnostic(query) {
+            return Ok(diagnostic);
+        }
         let glob = optional_string(&arguments, "glob");
         let path = optional_string(&arguments, "path");
         if let Some(path) = path.filter(|path| path.contains('|')) {
@@ -407,11 +411,15 @@ impl BuiltinToolRegistry {
 
     fn invoke_find_file(&self, arguments: Map<String, Value>) -> Result<String> {
         let pattern = required_string(&arguments, "pattern")?;
+        let include_metadata = arguments
+            .get("include_metadata")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if pattern.contains('|') {
             let mut matches = Vec::new();
             for pattern in split_pipe_alternatives(pattern) {
-                let output = fs::find_files(&self.workspace_cwd, pattern)?;
-                if output == "No files found." {
+                let output = fs::find_files(&self.workspace_cwd, pattern, false)?;
+                if output.starts_with("No files matching `") {
                     continue;
                 }
                 for line in output.lines() {
@@ -423,11 +431,13 @@ impl BuiltinToolRegistry {
             matches.sort();
             return Ok(if matches.is_empty() {
                 "No files found.".to_owned()
+            } else if include_metadata {
+                render_find_file_metadata(&self.workspace_cwd, pattern, &matches)
             } else {
                 matches.join("\n")
             });
         }
-        fs::find_files(&self.workspace_cwd, pattern)
+        fs::find_files(&self.workspace_cwd, pattern, include_metadata)
     }
 
     async fn invoke_web_search(&self, arguments: Map<String, Value>) -> Result<String> {
@@ -593,7 +603,7 @@ impl BuiltinToolRegistry {
         ];
         let rewritten = sanitize_generated_file_content(
             &model
-                .complete(&messages, &[], 3000, 0.0, None)
+                .complete(&messages, &[], 3000, 0.0, None, None)
                 .await?
                 .content
                 .unwrap_or_default(),
@@ -688,7 +698,7 @@ impl BuiltinToolRegistry {
         ];
         let content = sanitize_generated_file_content(
             &model
-                .complete(&content_messages, &[], 3000, 0.1, None)
+                .complete(&content_messages, &[], 3000, 0.1, None, None)
                 .await?
                 .content
                 .unwrap_or_default(),
@@ -796,13 +806,9 @@ fn looks_like_file_content(instruction: &str) -> bool {
 }
 
 fn sanitize_generated_file_content(text: &str) -> String {
-    let mut cleaned = text.replace("<|im_end|>", "").replace("<|im_start|>", "");
+    let mut cleaned = text.to_owned();
 
-    for (open, close) in [
-        ("<thinking>", "</thinking>"),
-        ("<think>", "</think>"),
-        ("<|think|>", "<|/think|>"),
-    ] {
+    for (open, close) in [("<|think|>", "<|/think|>")] {
         while let Some(start) = cleaned.find(open) {
             if let Some(end_rel) = cleaned[start + open.len()..].find(close) {
                 let end = start + open.len() + end_rel + close.len();
@@ -839,10 +845,6 @@ fn sanitize_generated_file_content(text: &str) -> String {
         .replace("<|channel>thought", "")
         .replace("<|think|>", "")
         .replace("<|/think|>", "")
-        .replace("<think>", "")
-        .replace("</think>", "")
-        .replace("<thinking>", "")
-        .replace("</thinking>", "")
         .replace("<|turn|>", "")
         .replace("<turn|>", "")
         .replace("</turn>", "");
@@ -863,7 +865,7 @@ async fn infer_kind(model: &dyn ModelClient, instruction: &str) -> Result<String
         ),
         ChatMessage::user(instruction),
     ];
-    let result = model.complete(&messages, &[], 20, 0.0, None).await?;
+    let result = model.complete(&messages, &[], 20, 0.0, None, None).await?;
     let kind = result.content.unwrap_or_default().trim().to_lowercase();
     if matches!(
         kind.as_str(),
@@ -885,7 +887,7 @@ async fn infer_filename(model: &dyn ModelClient, instruction: &str, kind: &str) 
         )),
         ChatMessage::user(instruction),
     ];
-    let result = model.complete(&messages, &[], 40, 0.0, None).await?;
+    let result = model.complete(&messages, &[], 40, 0.0, None, None).await?;
 
     let candidate = result
         .content
@@ -1030,12 +1032,14 @@ fn file_chunk_lines(content: &str, start_line: usize, limit: usize, path: Option
         metadata.insert("start_line".to_owned(), json!(start_line));
         metadata.insert("end_line".to_owned(), json!(to));
         metadata.insert("total_lines".to_owned(), json!(total));
+        metadata.insert("complete".to_owned(), Value::Bool(false));
         metadata.insert("truncated".to_owned(), Value::Bool(true));
         metadata.insert("next_start_line".to_owned(), json!(next_start_line));
+        metadata.insert("remaining_lines".to_owned(), json!(total - to));
         metadata.insert(
             "continuation_hint".to_owned(),
             Value::String(format!(
-                "Continue with read_file_tool start_line={next_start_line} if the current function, block, or requested flow boundary is incomplete."
+                "This read is partial. Continue with read_file_tool start_line={next_start_line} if the current function, block, file, or requested boundary is incomplete. Do not state that the whole file was read unless a read result reaches end of file."
             )),
         );
         serde_json::to_string_pretty(&Value::Object(metadata))
@@ -1049,6 +1053,42 @@ fn format_file_line(line_number: usize, line: &str) -> String {
 
 fn file_preview(content: &str) -> String {
     file_chunk_lines(content, 1, 80, None)
+}
+
+fn render_find_file_metadata(cwd: &Path, pattern: &str, paths: &[String]) -> String {
+    if paths.len() > fs::MAX_FIND_METADATA_FILES {
+        return json!({
+            "pattern": pattern,
+            "metadata_included": false,
+            "metadata_omitted_reason": format!("matched {} files; metadata is only included for up to {} files", paths.len(), fs::MAX_FIND_METADATA_FILES),
+            "files": paths,
+        })
+        .to_string();
+    }
+
+    let files = paths
+        .iter()
+        .map(|path| {
+            let absolute = cwd.join(path);
+            let size_bytes = std::fs::metadata(&absolute).ok().map(|m| m.len());
+            let line_count = std::fs::read_to_string(&absolute)
+                .ok()
+                .map(|content| content.lines().count());
+            json!({
+                "path": path,
+                "size_bytes": size_bytes,
+                "line_count": line_count,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "pattern": pattern,
+        "metadata_included": true,
+        "files": files,
+        "hint": "Use line_count to choose targeted reads, larger read_file_tool limits, or consecutive reads. The default read_file_tool limit is one page, not whole-file evidence."
+    })
+    .to_string()
 }
 
 fn read_file_diagnostic_error(
@@ -1089,6 +1129,38 @@ fn search_code_diagnostic_error(query: &str, glob: Option<&str>, path: &str, cwd
         }
     })
     .to_string()
+}
+
+fn search_code_wrong_tool_diagnostic(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let file_lookup = trimmed
+        .strip_prefix("path:")
+        .or_else(|| trimmed.strip_prefix("file:"))?;
+    let suggested_pattern = file_lookup.trim().trim_matches(['"', '\'', '`']);
+    let suggested_pattern = if suggested_pattern.is_empty() {
+        "**/*".to_owned()
+    } else if suggested_pattern.contains('*') || suggested_pattern.contains('/') {
+        suggested_pattern.to_owned()
+    } else {
+        format!("**/*{suggested_pattern}")
+    };
+
+    Some(
+        json!({
+            "code": "wrong_tool_for_file_lookup",
+            "message": "search_code_tool searches file contents, not file paths",
+            "diagnostics": {
+                "query": query,
+                "suggested_tool": "find_file_tool",
+                "suggested_arguments": {
+                    "pattern": suggested_pattern,
+                    "include_metadata": true,
+                },
+                "next_step": "Use find_file_tool to locate paths, then use search_code_tool scoped to a found path for symbols or exact text."
+            }
+        })
+        .to_string(),
+    )
 }
 
 fn patch_diagnostic_error(
@@ -1324,12 +1396,26 @@ mod tests {
     impl crate::agent_loop::ModelClient for MockModel {
         async fn complete(
             &self,
-            _messages: &[ChatMessage],
+            messages: &[ChatMessage],
             _tools: &[serde_json::Value],
             _max_tokens: u32,
             _temperature: f32,
             _think_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+            _answer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         ) -> Result<crate::mlx_client::CompletionResult> {
+            if messages.iter().any(|message| {
+                message.role == "system"
+                    && message
+                        .content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("Task contract classifier")
+            }) {
+                return Ok(text_result(
+                    r#"{"goal":"test task","allowed_to_answer_without_tools":true,"final_conditions":[],"failure_policy":"none"}"#,
+                ));
+            }
+
             self.responses
                 .lock()
                 .await
@@ -1368,6 +1454,102 @@ mod tests {
                 "create_artifact_tool",
             ]
         );
+    }
+
+    #[test]
+    fn read_file_tool_schema_mentions_adjustable_limit() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        let schemas = registry.tool_schemas();
+        let read_schema = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == "read_file_tool")
+            .expect("read_file_tool schema");
+
+        let description = read_schema["function"]["description"]
+            .as_str()
+            .expect("description");
+        let limit_description =
+            read_schema["function"]["parameters"]["properties"]["limit"]["description"]
+                .as_str()
+                .expect("limit description");
+
+        assert!(description.contains("Default `limit` is 200"));
+        assert!(description.contains("callers may request a larger limit"));
+        assert!(description.contains("prefer search_code_tool first"));
+        assert!(description.contains("complete: false"));
+        assert!(description.contains("remaining_lines"));
+        assert!(description.contains("Do not claim a whole file was read"));
+        assert!(limit_description.contains("Use a larger value"));
+        assert!(limit_description.contains("otherwise keep reads targeted"));
+    }
+
+    #[test]
+    fn search_code_tool_schema_says_search_results_are_candidates() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        let schemas = registry.tool_schemas();
+        let search_schema = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == "search_code_tool")
+            .expect("search_code_tool schema");
+
+        let description = search_schema["function"]["description"]
+            .as_str()
+            .expect("description");
+
+        assert!(description.contains("Search file contents with ripgrep"));
+        assert!(description.contains("Do not use for filename/path lookup"));
+        assert!(description.contains("use find_file_tool for that"));
+        assert!(description.contains("Results are candidates only"));
+        assert!(description.contains("read files before code claims"));
+        assert!(description.contains("Search snippets are not source-read evidence"));
+        assert!(description.contains("do not count as having read a file"));
+        assert!(
+            description
+                .contains("call read_file_tool for each relevant function/block before citing")
+        );
+        assert!(description.contains("valid ripgrep regex"));
+        assert!(description.contains("Do not use wildcard-only queries"));
+        assert!(description.contains("fn|struct|impl"));
+
+        let query_description =
+            search_schema["function"]["parameters"]["properties"]["query"]["description"]
+                .as_str()
+                .expect("query description");
+        assert!(query_description.contains("Valid ripgrep regex"));
+        assert!(query_description.contains("inside files"));
+        assert!(query_description.contains("Do not use `path:foo.rs`"));
+        assert!(query_description.contains("use find_file_tool"));
+        assert!(query_description.contains("wildcard-only queries"));
+    }
+
+    #[test]
+    fn find_file_tool_schema_exposes_optional_metadata() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        let schemas = registry.tool_schemas();
+        let find_schema = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == "find_file_tool")
+            .expect("find_file_tool schema");
+
+        let description = find_schema["function"]["description"]
+            .as_str()
+            .expect("description");
+        let metadata_description =
+            find_schema["function"]["parameters"]["properties"]["include_metadata"]["description"]
+                .as_str()
+                .expect("include_metadata description");
+
+        assert!(description.contains("include_metadata: true"));
+        assert!(description.contains("Find file paths"));
+        assert!(description.contains("Use this, not search_code_tool"));
+        assert!(description.contains("line counts or file sizes"));
+        assert!(description.contains("choose targeted reads"));
+        assert!(description.contains("Metadata is bounded"));
+        assert!(metadata_description.contains("path, size_bytes, and line_count"));
+        assert!(metadata_description.contains("read_file_tool limits"));
     }
 
     // -----------------------------------------------------------------------
@@ -1452,9 +1634,6 @@ mod tests {
     #[test]
     fn sanitize_generated_file_content_strips_meta_and_channel_leaks() {
         let raw = r#"
-<thinking>
-plan first
-</thinking>
 <|channel>thought
 This should not be written.
 <channel|>
@@ -1656,7 +1835,7 @@ Body text.
         let model = Arc::new(MockModel::new(vec![
             "markdown",
             "doc.md",
-            "<thinking>draft</thinking>\n<|channel>thought\ninternal\n<channel|>\n# Hello\nThis is the doc.\n",
+            "<|think|>draft<|/think|>\n<|channel>thought\ninternal\n<channel|>\n# Hello\nThis is the doc.\n",
         ]));
         let registry =
             BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
@@ -1990,8 +2169,22 @@ Body text.
         assert_eq!(page1_json["start_line"], 1);
         assert_eq!(page1_json["end_line"], 200);
         assert_eq!(page1_json["total_lines"], 450);
+        assert_eq!(page1_json["complete"], false);
         assert_eq!(page1_json["truncated"], true);
         assert_eq!(page1_json["next_start_line"], 201);
+        assert_eq!(page1_json["remaining_lines"], 250);
+        assert!(
+            page1_json["continuation_hint"]
+                .as_str()
+                .expect("continuation hint")
+                .contains("This read is partial")
+        );
+        assert!(
+            page1_json["continuation_hint"]
+                .as_str()
+                .expect("continuation hint")
+                .contains("whole file was read")
+        );
         assert!(
             page1_json["content"]
                 .as_str()
@@ -2014,8 +2207,10 @@ Body text.
         let page2_json: serde_json::Value = serde_json::from_str(&page2).expect("page 2 metadata");
         assert_eq!(page2_json["start_line"], 201);
         assert_eq!(page2_json["end_line"], 400);
+        assert_eq!(page2_json["complete"], false);
         assert_eq!(page2_json["truncated"], true);
         assert_eq!(page2_json["next_start_line"], 401);
+        assert_eq!(page2_json["remaining_lines"], 50);
 
         // Third read: start_line=401 gets the rest.
         let page3 = futures::executor::block_on(
@@ -2170,5 +2365,114 @@ Body text.
 
         assert!(result.contains("src/acp.rs"), "{result}");
         assert!(result.contains("src/agent_loop.rs"), "{result}");
+    }
+
+    #[test]
+    fn search_code_tool_reports_wrong_tool_for_path_lookup_query() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        stdfs::create_dir_all(tempdir.path().join("src")).expect("mkdir");
+        stdfs::write(
+            tempdir.path().join("src/acp.rs"),
+            "fn handle_message() {}\n",
+        )
+        .expect("write");
+
+        let result = futures::executor::block_on(
+            registry.invoke(
+                "search_code_tool",
+                json!({"query": "path:acp.rs"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
+        .expect("wrong-tool diagnostic should return output");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("diagnostic result should be json");
+
+        assert_eq!(parsed["code"], "wrong_tool_for_file_lookup");
+        assert_eq!(parsed["diagnostics"]["suggested_tool"], "find_file_tool");
+        assert_eq!(
+            parsed["diagnostics"]["suggested_arguments"]["pattern"],
+            "**/*acp.rs"
+        );
+        assert_eq!(
+            parsed["diagnostics"]["suggested_arguments"]["include_metadata"],
+            true
+        );
+        assert!(
+            parsed["diagnostics"]["next_step"]
+                .as_str()
+                .expect("next step")
+                .contains("scoped to a found path")
+        );
+    }
+
+    #[test]
+    fn find_file_tool_can_return_metadata_for_small_result_sets() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        stdfs::create_dir_all(tempdir.path().join("src")).expect("mkdir");
+        stdfs::write(tempdir.path().join("src/acp.rs"), "line 1\nline 2\n").expect("write");
+
+        let result = futures::executor::block_on(
+            registry.invoke(
+                "find_file_tool",
+                json!({"pattern": "src/acp.rs", "include_metadata": true})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
+        .expect("metadata find should work");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("metadata result should be json");
+
+        assert_eq!(parsed["metadata_included"], true);
+        assert_eq!(parsed["files"][0]["path"], "src/acp.rs");
+        assert_eq!(parsed["files"][0]["line_count"], 2);
+        assert_eq!(parsed["files"][0]["size_bytes"], 14);
+        assert!(
+            parsed["hint"]
+                .as_str()
+                .expect("hint")
+                .contains("default read_file_tool limit is one page")
+        );
+    }
+
+    #[test]
+    fn find_file_tool_metadata_supports_pipe_separated_patterns() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        stdfs::create_dir_all(tempdir.path().join("src")).expect("mkdir");
+        stdfs::write(tempdir.path().join("src/acp.rs"), "one\n").expect("write");
+        stdfs::write(tempdir.path().join("src/agent_loop.rs"), "one\ntwo\n").expect("write");
+
+        let result = futures::executor::block_on(
+            registry.invoke(
+                "find_file_tool",
+                json!({
+                    "pattern": "src/acp.rs|src/agent_loop.rs",
+                    "include_metadata": true
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            ),
+        )
+        .expect("pipe metadata find should work");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("metadata result should be json");
+
+        assert_eq!(parsed["metadata_included"], true);
+        assert_eq!(parsed["files"].as_array().expect("files").len(), 2);
+        assert!(
+            parsed["files"]
+                .as_array()
+                .expect("files")
+                .iter()
+                .any(|file| file["path"] == "src/agent_loop.rs" && file["line_count"] == 2)
+        );
     }
 }

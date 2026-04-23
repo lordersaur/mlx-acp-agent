@@ -4,20 +4,18 @@ use regex::Regex;
 ///
 /// Returns `(thoughts, cleaned_text)` where `thoughts` is a vec of extracted
 /// reasoning strings and `cleaned_text` has all thought markers removed.
-pub fn extract_thought_blocks(text: &str) -> (Vec<String>, String) {
+pub fn extract_thought_blocks(raw_text: &str) -> (Vec<String>, String) {
     let mut thoughts = Vec::new();
 
     let balanced_patterns = [
         (
-            Regex::new(r"(?s)<\|channel>thought\n(.*?)<channel\|>").unwrap(),
+            Regex::new(r"(?s)<\|channel>thought(?:[ \t]*\r?\n|[ \t]+)?(.*?)<channel\|>").unwrap(),
             1usize,
         ),
-        (Regex::new(r"(?s)<thinking>(.*?)</thinking>").unwrap(), 1),
-        (Regex::new(r"(?s)<think>(.*?)</think>").unwrap(), 1),
         (Regex::new(r"(?s)<\|think\|>(.*?)<\|/think\|>").unwrap(), 1),
     ];
 
-    let mut working = text.to_owned();
+    let mut working = raw_text.to_owned();
     for (re, group) in balanced_patterns {
         working = re
             .replace_all(&working, |caps: &regex::Captures<'_>| {
@@ -32,8 +30,6 @@ pub fn extract_thought_blocks(text: &str) -> (Vec<String>, String) {
     }
 
     let prefilled_close_patterns = [
-        (Regex::new(r"(?s)^(.*?)</think>(.*)$").unwrap(), 1usize),
-        (Regex::new(r"(?s)^(.*?)</thinking>(.*)$").unwrap(), 1usize),
         (Regex::new(r"(?s)^(.*?)<\|/think\|>(.*)$").unwrap(), 1usize),
         (Regex::new(r"(?s)^(.*?)<channel\|>(.*)$").unwrap(), 1usize),
     ];
@@ -58,9 +54,7 @@ pub fn extract_thought_blocks(text: &str) -> (Vec<String>, String) {
     }
 
     let orphan_open_patterns = [
-        Regex::new(r"(?s)<\|channel>thought\n(.*)$").unwrap(),
-        Regex::new(r"(?s)<thinking>(.*)$").unwrap(),
-        Regex::new(r"(?s)<think>(.*)$").unwrap(),
+        Regex::new(r"(?s)<\|channel>thought(?:[ \t]*\r?\n|[ \t]+)?(.*)$").unwrap(),
         Regex::new(r"(?s)<\|think\|>(.*)$").unwrap(),
     ];
 
@@ -78,7 +72,7 @@ pub fn extract_thought_blocks(text: &str) -> (Vec<String>, String) {
         }
     }
 
-    // Drop any leftover orphan tags and collapse excess blank lines.
+    // Drop leftover orphan thought tags and collapse excess blank lines.
     let stripped = strip_residual_meta(&working);
     let newline_re = Regex::new(r"\n{3,}").unwrap();
     let cleaned = newline_re.replace_all(&stripped, "\n\n").trim().to_owned();
@@ -87,44 +81,19 @@ pub fn extract_thought_blocks(text: &str) -> (Vec<String>, String) {
 }
 
 fn strip_residual_meta(text: &str) -> String {
-    let drop_meta_lines = Regex::new(
-        r"(?m)^\s*(?:<\|channel>|<channel\|>|<thinking>|</thinking>|<think>|</think>|<\|think\|>|<\|/think\|>|<\|turn\|>|<turn\|>|</turn>).*$",
-    )
-    .unwrap();
+    let drop_meta_lines =
+        Regex::new(r"(?m)^\s*(?:<\|channel>|<channel\|>|<\|think\|>|<\|/think\|>).*$").unwrap();
     let stripped_lines = drop_meta_lines.replace_all(text, "");
     stripped_lines
         .replace("<|channel>", "")
         .replace("<channel|>", "")
-        .replace("<thinking>", "")
-        .replace("</thinking>", "")
-        .replace("<think>", "")
-        .replace("</think>", "")
         .replace("<|think|>", "")
         .replace("<|/think|>", "")
-        .replace("<|turn|>", "")
-        .replace("<turn|>", "")
-        .replace("</turn>", "")
 }
 
 #[cfg(test)]
 mod tests {
     use super::extract_thought_blocks;
-
-    #[test]
-    fn strips_thinking_block_and_returns_thought() {
-        let raw = "<thinking>\nI should inspect the file first.\n</thinking>\nThe answer is 42.";
-        let (thoughts, text) = extract_thought_blocks(raw);
-        assert_eq!(thoughts, vec!["I should inspect the file first."]);
-        assert_eq!(text, "The answer is 42.");
-    }
-
-    #[test]
-    fn strips_think_alias() {
-        let raw = "<think>some reasoning</think>final answer";
-        let (thoughts, text) = extract_thought_blocks(raw);
-        assert_eq!(thoughts, vec!["some reasoning"]);
-        assert_eq!(text, "final answer");
-    }
 
     #[test]
     fn strips_gemma_think_token_pair() {
@@ -143,8 +112,16 @@ mod tests {
     }
 
     #[test]
+    fn strips_channel_block_without_newline_after_label() {
+        let raw = "<|channel>thought I will check the repo.<channel|>Here is the result.";
+        let (thoughts, text) = extract_thought_blocks(raw);
+        assert_eq!(thoughts, vec!["I will check the repo."]);
+        assert_eq!(text, "Here is the result.");
+    }
+
+    #[test]
     fn strips_prefilled_close_form() {
-        let raw = "I will check the repo.</thinking>Here is the result.";
+        let raw = "I will check the repo.<channel|>Here is the result.";
         let (thoughts, text) = extract_thought_blocks(raw);
         assert_eq!(thoughts, vec!["I will check the repo."]);
         assert_eq!(text, "Here is the result.");
@@ -166,13 +143,29 @@ mod tests {
     }
 
     #[test]
+    fn preserves_non_gemma_thinking_aliases() {
+        let raw = "<thinking>I will check the repo.</thinking>\nHere is the result.";
+        let (thoughts, text) = extract_thought_blocks(raw);
+        assert!(thoughts.is_empty());
+        assert_eq!(text, raw);
+    }
+
+    #[test]
     fn strips_unclosed_thinking_block() {
-        let raw = "<thinking>\nI should call a tool but never close the tag.";
+        let raw = "<|channel>thought\nI should call a tool but never close the tag.";
         let (thoughts, text) = extract_thought_blocks(raw);
         assert_eq!(
             thoughts,
             vec!["I should call a tool but never close the tag."]
         );
         assert_eq!(text, "");
+    }
+
+    #[test]
+    fn preserves_non_thought_gemma_control_tokens() {
+        let raw = "<|think|>\nI will search.\n<|/think|>\nFinal answer.\n<|turn|>user\nWhat's next?\n<turn|>";
+        let (thoughts, text) = extract_thought_blocks(raw);
+        assert_eq!(thoughts, vec!["I will search."]);
+        assert_eq!(text, "Final answer.\n<|turn|>user\nWhat's next?\n<turn|>");
     }
 }
