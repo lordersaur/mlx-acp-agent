@@ -1,15 +1,8 @@
 /// Session store — mirrors sessions.py.
 ///
-/// Tracks conversation history, active command sessions, and interruption
-/// state for each ACP session.  Phase 6 adds disk persistence so chat
-/// history survives editor restarts.
+/// Tracks conversation history and active command sessions for each ACP
+/// session. Session data stays in memory for the life of the process.
 use std::collections::HashMap;
-use std::fs;
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -23,12 +16,6 @@ use crate::agent_loop::ToolExecution;
 // ---------------------------------------------------------------------------
 
 const MAX_LAST_OUTPUT_CHARS: usize = 1200;
-
-/// Maximum number of turns to persist to disk.
-const MAX_PERSISTED_TURNS: usize = 40;
-
-/// Maximum byte size per turn content when persisting (4 KiB).
-const MAX_PERSISTED_TURN_CONTENT: usize = 4096;
 
 const VALIDATION_TERMS: &[&str] = &[
     "test",
@@ -84,10 +71,7 @@ pub struct SessionState {
     pub cwd: String,
     pub mode_id: String,
     pub turns: Vec<TurnRecord>,
-    pub reasoning_summary: Option<String>,
     pub active_command_sessions: HashMap<String, CommandSessionInfo>,
-    pub interrupted: bool,
-    pub pending_task: Option<String>,
     /// UI-only: maps event key → external tool-call id
     pub active_tool_calls: HashMap<String, String>,
     pub tool_event_counter: u64,
@@ -103,10 +87,7 @@ pub fn new_session(cwd: &str) -> SessionState {
         cwd: cwd.to_owned(),
         mode_id: "agent".to_owned(),
         turns: Vec::new(),
-        reasoning_summary: None,
         active_command_sessions: HashMap::new(),
-        interrupted: false,
-        pending_task: None,
         active_tool_calls: HashMap::new(),
         tool_event_counter: 0,
     }
@@ -203,7 +184,7 @@ fn handle_session_start(state: &mut SessionState, tr: &ToolExecution) {
     let payload: Value = match serde_json::from_str(&tr.result) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Failed to parse session read payload: {}", e);
+            warn!("failed to parse session read payload: {e}");
             return;
         }
     };
@@ -266,7 +247,7 @@ fn handle_session_read(state: &mut SessionState, tr: &ToolExecution) {
     let payload: Value = match serde_json::from_str(&tr.result) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Failed to parse session read payload: {}", e);
+            warn!("failed to parse session read payload: {e}");
             return;
         }
     };
@@ -325,7 +306,7 @@ fn extract_file_change(record: &mut TurnRecord, result: &str) {
     let payload: Value = match serde_json::from_str(result) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Failed to parse session read payload: {}", e);
+            warn!("failed to parse file change payload: {e}");
             return;
         }
     };
@@ -405,194 +386,6 @@ fn extract_command_output(result: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Persisted session history (Phase 6)
-// ---------------------------------------------------------------------------
-
-/// On-disk representation of a session's durable state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedSession {
-    pub session_id: String,
-    pub cwd: String,
-    pub mode_id: String,
-    pub turns: Vec<TurnRecord>,
-    #[serde(default)]
-    pub reasoning_summary: Option<String>,
-    pub interrupted: bool,
-    pub pending_task: Option<String>,
-    /// Snapshot of active command sessions at persist time so we can show
-    /// context on reload (actual process liveness is re-checked separately).
-    pub active_command_sessions: HashMap<String, CommandSessionInfo>,
-}
-
-#[cfg(test)]
-static TEST_HISTORY_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-#[cfg(test)]
-static TEST_HISTORY_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-fn history_dir() -> PathBuf {
-    #[cfg(test)]
-    {
-        if let Some(path) = TEST_HISTORY_DIR
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return path;
-        }
-    }
-
-    if let Ok(path) = std::env::var("MLX_ACP_HISTORY_DIR") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".mlx-acp-agent")
-        .join("history")
-}
-
-fn history_path(session_id: &str) -> PathBuf {
-    history_dir().join(format!("{session_id}.json"))
-}
-
-/// Persist the durable subset of a session to disk.
-pub fn persist_session(state: &SessionState) {
-    let mut turns: Vec<TurnRecord> = state.turns.clone();
-
-    // Truncate to bounded size.
-    if turns.len() > MAX_PERSISTED_TURNS {
-        let drain_to = turns.len() - MAX_PERSISTED_TURNS;
-        turns.drain(..drain_to);
-    }
-
-    // Trim individual turn content to keep the file small.
-    for turn in &mut turns {
-        if turn.content.len() > MAX_PERSISTED_TURN_CONTENT {
-            turn.content.truncate(MAX_PERSISTED_TURN_CONTENT);
-            turn.content.push_str("\n... [truncated]");
-        }
-    }
-
-    let persisted = PersistedSession {
-        session_id: state.session_id.clone(),
-        cwd: state.cwd.clone(),
-        mode_id: state.mode_id.clone(),
-        turns,
-        reasoning_summary: state.reasoning_summary.clone(),
-        interrupted: state.interrupted,
-        pending_task: state.pending_task.clone(),
-        active_command_sessions: state.active_command_sessions.clone(),
-    };
-
-    let dir = history_dir();
-    if let Err(e) = fs::create_dir_all(&dir) {
-        warn!("failed to create history dir {}: {e}", dir.display());
-        return;
-    }
-    let path = history_path(&state.session_id);
-    match serde_json::to_string_pretty(&persisted) {
-        Ok(json) => {
-            if let Err(e) = fs::write(&path, json) {
-                warn!("failed to write history {}: {e}", path.display());
-            }
-        }
-        Err(e) => warn!("failed to serialize history: {e}"),
-    }
-}
-
-/// Try to load a previously persisted session from disk.  Returns `None` if
-/// the file does not exist or cannot be parsed.
-pub fn load_persisted_session(session_id: &str) -> Option<PersistedSession> {
-    let path = history_path(session_id);
-    let data = fs::read_to_string(&path).ok()?;
-    match serde_json::from_str::<PersistedSession>(&data) {
-        Ok(persisted) => Some(persisted),
-        Err(e) => {
-            warn!("failed to parse persisted session {}: {e}", path.display());
-            None
-        }
-    }
-}
-
-/// Restore a `SessionState` from a `PersistedSession`, merging with the
-/// provided `cwd` (the editor may have moved).
-pub fn restore_session(persisted: PersistedSession, cwd: &str) -> SessionState {
-    SessionState {
-        session_id: persisted.session_id,
-        cwd: cwd.to_owned(),
-        mode_id: persisted.mode_id,
-        turns: persisted.turns,
-        reasoning_summary: persisted.reasoning_summary,
-        active_command_sessions: persisted.active_command_sessions,
-        interrupted: persisted.interrupted,
-        pending_task: persisted.pending_task,
-        active_tool_calls: HashMap::new(),
-        tool_event_counter: 0,
-    }
-}
-
-/// List all persisted session IDs (used for diagnostics / cleanup).
-pub fn list_persisted_sessions() -> Vec<String> {
-    let dir = history_dir();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let name = entry.file_name().into_string().ok()?;
-            name.strip_suffix(".json").map(str::to_owned)
-        })
-        .collect()
-}
-
-/// Remove persisted history files older than `max_age`.
-pub fn prune_old_history(max_age: std::time::Duration) {
-    let dir = history_dir();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        if now.duration_since(modified).unwrap_or_default() > max_age {
-            fs::remove_file(entry.path()).ok();
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn set_test_history_dir(path: &Path) {
-    *TEST_HISTORY_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
-}
-
-#[cfg(test)]
-pub(crate) fn clear_test_history_dir() {
-    *TEST_HISTORY_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
-}
-
-#[cfg(test)]
-pub(crate) fn with_test_history_dir<T>(path: &Path, f: impl FnOnce() -> T) -> T {
-    let _guard = TEST_HISTORY_DIR_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    set_test_history_dir(path);
-    let result = f();
-    clear_test_history_dir();
-    result
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -658,217 +451,5 @@ mod tests {
         );
         update_command_sessions(&mut state, &[terminate]);
         assert!(!state.active_command_sessions.contains_key("cmdsess_abc"));
-    }
-
-    #[test]
-    fn update_command_sessions_tracks_long_running_run_command_sessions() {
-        let mut state = new_session("/tmp");
-        let running = tool_exec(
-            "run_command_tool",
-            json!({"cmd": "for i in 1 2 3; do echo tick; sleep 5; done"}),
-            "$ for i in 1 2 3; do echo tick; sleep 5; done\n\nsession_id: cmdsess_run123\n\nrunning: true\n\nstdout:\ntick\n\nstderr:\n\n[command is still running in session `cmdsess_run123`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]",
-        );
-
-        update_command_sessions(&mut state, &[running]);
-        let info = state
-            .active_command_sessions
-            .get("cmdsess_run123")
-            .expect("tracked session");
-        assert_eq!(info.cmd, "for i in 1 2 3; do echo tick; sleep 5; done");
-        assert_eq!(info.last_output, "tick");
-        assert!(info.running);
-    }
-
-    #[test]
-    fn run_command_session_output_keeps_stderr_for_debugging() {
-        let mut state = new_session("/tmp");
-        let running = tool_exec(
-            "run_command_tool",
-            json!({"cmd": "cargo test"}),
-            "$ cargo test\n\nsession_id: cmdsess_run123\n\nrunning: true\n\nstdout:\ncompiling\n\nstderr:\nwarning: failed to resolve cache\n\n[command is still running in session `cmdsess_run123`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]",
-        );
-
-        update_command_sessions(&mut state, &[running]);
-        let info = state
-            .active_command_sessions
-            .get("cmdsess_run123")
-            .expect("tracked session");
-        assert_eq!(
-            info.last_output,
-            "compiling\n\nstderr:\nwarning: failed to resolve cache"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase 6: persistence tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn persist_and_reload_session_round_trips() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        super::with_test_history_dir(tempdir.path(), || {
-            let mut state = new_session("/projects/foo");
-            state.turns.push(build_turn_record("user", "hello", &[]));
-            state
-                .turns
-                .push(build_turn_record("assistant", "Hi! How can I help?", &[]));
-            state.pending_task = Some("fix the bug".to_owned());
-            state.interrupted = true;
-
-            super::persist_session(&state);
-
-            let loaded = super::load_persisted_session(&state.session_id)
-                .expect("should load persisted session");
-            assert_eq!(loaded.session_id, state.session_id);
-            assert_eq!(loaded.turns.len(), 2);
-            assert_eq!(loaded.turns[0].role, "user");
-            assert_eq!(loaded.turns[0].content, "hello");
-            assert_eq!(loaded.turns[1].role, "assistant");
-            assert!(loaded.interrupted);
-            assert_eq!(loaded.pending_task.as_deref(), Some("fix the bug"));
-        });
-    }
-
-    #[test]
-    fn persist_truncates_old_turns() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        super::with_test_history_dir(tempdir.path(), || {
-            let mut state = new_session("/tmp");
-            for i in 0..60 {
-                state.turns.push(build_turn_record(
-                    if i % 2 == 0 { "user" } else { "assistant" },
-                    &format!("turn {i}"),
-                    &[],
-                ));
-            }
-
-            super::persist_session(&state);
-
-            let loaded = super::load_persisted_session(&state.session_id).expect("should load");
-            assert_eq!(loaded.turns.len(), super::MAX_PERSISTED_TURNS);
-            // Should keep the most recent turns
-            assert_eq!(loaded.turns[0].content, "turn 20");
-            assert_eq!(loaded.turns.last().unwrap().content, "turn 59");
-        });
-    }
-
-    #[test]
-    fn persist_truncates_large_turn_content() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        super::with_test_history_dir(tempdir.path(), || {
-            let mut state = new_session("/tmp");
-            let big_content = "x".repeat(10_000);
-            state
-                .turns
-                .push(build_turn_record("user", &big_content, &[]));
-
-            super::persist_session(&state);
-
-            let loaded = super::load_persisted_session(&state.session_id).expect("should load");
-            assert!(loaded.turns[0].content.len() < 5000);
-            assert!(loaded.turns[0].content.ends_with("... [truncated]"));
-        });
-    }
-
-    #[test]
-    fn restore_session_uses_new_cwd() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        super::with_test_history_dir(tempdir.path(), || {
-            let mut state = new_session("/old/path");
-            state.turns.push(build_turn_record("user", "test", &[]));
-            super::persist_session(&state);
-
-            let persisted = super::load_persisted_session(&state.session_id).expect("should load");
-            let restored = super::restore_session(persisted, "/new/path");
-            assert_eq!(restored.cwd, "/new/path");
-            assert_eq!(restored.session_id, state.session_id);
-            assert_eq!(restored.turns.len(), 1);
-        });
-    }
-
-    #[test]
-    fn load_nonexistent_session_returns_none() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        super::with_test_history_dir(tempdir.path(), || {
-            assert!(super::load_persisted_session("sess_doesnotexist").is_none());
-        });
-    }
-
-    #[test]
-    fn persist_includes_active_command_sessions() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        super::with_test_history_dir(tempdir.path(), || {
-            let mut state = new_session("/tmp");
-            state.active_command_sessions.insert(
-                "cmdsess_abc".to_owned(),
-                super::CommandSessionInfo {
-                    session_id: "cmdsess_abc".to_owned(),
-                    cmd: "tail -f log.txt".to_owned(),
-                    last_output: "ready".to_owned(),
-                    running: true,
-                    exit_code: None,
-                },
-            );
-
-            super::persist_session(&state);
-
-            let loaded = super::load_persisted_session(&state.session_id).expect("should load");
-            assert_eq!(loaded.active_command_sessions.len(), 1);
-            let info = loaded.active_command_sessions.get("cmdsess_abc").unwrap();
-            assert_eq!(info.cmd, "tail -f log.txt");
-        });
-    }
-
-    #[test]
-    fn list_persisted_sessions_finds_saved_sessions() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        super::with_test_history_dir(tempdir.path(), || {
-            let s1 = new_session("/a");
-            let s2 = new_session("/b");
-            super::persist_session(&s1);
-            super::persist_session(&s2);
-
-            let ids = super::list_persisted_sessions();
-            assert!(ids.contains(&s1.session_id));
-            assert!(ids.contains(&s2.session_id));
-        });
-    }
-
-    #[test]
-    fn interrupted_task_survives_restart() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        super::with_test_history_dir(tempdir.path(), || {
-            let mut state = new_session("/projects/myapp");
-            // Simulate a multi-turn conversation
-            state
-                .turns
-                .push(build_turn_record("user", "refactor the auth module", &[]));
-            state.turns.push(build_turn_record(
-                "assistant",
-                "I'll start by reading the auth module.",
-                &[tool_exec(
-                    "read_file_tool",
-                    json!({"path": "src/auth.rs"}),
-                    "pub fn authenticate() {}",
-                )],
-            ));
-            // Task was interrupted mid-way
-            state.interrupted = true;
-            state.pending_task = Some("refactor the auth module".to_owned());
-
-            super::persist_session(&state);
-
-            // "Restart" — load from disk into a fresh session
-            let persisted = super::load_persisted_session(&state.session_id).expect("should load");
-            let restored = super::restore_session(persisted, "/projects/myapp");
-
-            assert!(restored.interrupted);
-            assert_eq!(
-                restored.pending_task.as_deref(),
-                Some("refactor the auth module")
-            );
-            assert_eq!(restored.turns.len(), 2);
-            assert_eq!(restored.turns[1].files_read, vec!["src/auth.rs"]);
-        });
     }
 }

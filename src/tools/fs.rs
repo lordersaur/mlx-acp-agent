@@ -237,7 +237,7 @@ pub fn find_files(cwd: &Path, pattern: &str, include_metadata: bool) -> Result<S
             "pattern": pattern,
             "metadata_included": true,
             "files": files,
-            "hint": "Use line_count to choose targeted reads, larger read_file_tool limits, or consecutive reads. The default read_file_tool limit is one page, not whole-file evidence."
+            "hint": "Use line_count as a planning aid: narrow lookups can stay targeted, while broad understanding may justify larger read_file_tool limits or consecutive reads."
         })
         .to_string());
     }

@@ -94,13 +94,29 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "read_file_tool",
-                    "description": "Read a file from the workspace. Returns up to `limit` lines starting at line `start_line` (1-based). Default `limit` is 200, but callers may request a larger limit when the user explicitly asks for a whole file or when a larger contiguous block is needed to understand the current function, file, or explanation boundary. For flow/lifecycle tasks, prefer search_code_tool first and read targeted regions instead of large whole-file reads.\nsearch_code_tool returns 1-based line numbers — pass them directly as start_line.\nIf output is truncated, the result is JSON with `complete: false`, `truncated: true`, `next_start_line`, and `remaining_lines`; continue from `next_start_line` when the current function/block/file or requested boundary is incomplete. Do not claim a whole file was read unless the returned output reaches end of file.\nNOTE: output lines are prefixed with `N: ` for display only — the actual file content does not contain these prefixes. Never include them in old_text when using patch_file_tool.",
+                    "description": "Read workspace file lines for inspection or understanding.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Path to the file, relative to the workspace root."},
-                            "start_line": {"type": "integer", "description": "1-based line number to start reading from (default 1)."},
-                            "limit": {"type": "integer", "description": "Max number of lines to return (default 200). Use a larger value when a wider contiguous read is necessary for the task; otherwise keep reads targeted."}
+                            "path": {"type": "string", "description": "File path."},
+                            "start_line": {"type": "integer", "description": "1-based line number."},
+                            "limit": {"type": "integer", "description": "Maximum lines to return; larger limits can help for broad understanding."}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "read_source_tree_tool",
+                    "description": "Read many files under a workspace directory.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Directory path."},
+                            "max_files": {"type": "integer", "description": "Maximum number of files."},
+                            "per_file_line_limit": {"type": "integer", "description": "Maximum lines per file."}
                         },
                         "required": ["path"]
                     }
@@ -110,11 +126,11 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "list_dir_tool",
-                    "description": "List files/directories in the workspace. Only call this when directory contents are genuinely unknown and search_code_tool cannot help. Never use as the first step for a code explanation or task — call search_code_tool first.",
+                    "description": "List workspace files and directories.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Directory path to inspect. Use \".\" for the current workspace root."}
+                            "path": {"type": "string", "description": "Directory path."}
                         }
                     }
                 }
@@ -123,13 +139,13 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "search_code_tool",
-                    "description": "Search file contents with ripgrep. Use for symbols, functions, handlers, route strings, or exact text inside files. Do not use for filename/path lookup; use find_file_tool for that. Results are candidates only; read files before code claims. Search snippets are not source-read evidence and do not count as having read a file.\n\n- Query must be valid ripgrep regex. Do not use wildcard-only queries like `*`; use concrete symbol patterns such as `fn|struct|impl`, function names, handlers, route strings, or escaped regex syntax.\n- Use `|` for multiple query alternatives: e.g. `handle_session_prompt|persist_session|ToolRegistry`.\n- Use `path` to scope content search to known files or directories: e.g. `path: \"src/acp.rs\"` or `path: \"src/tools|src/acp.rs\"`.\n- After search, call read_file_tool for each relevant function/block before citing it in a final answer.",
+                    "description": "Search file contents with ripgrep; use `|` to join alternate terms.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Valid ripgrep regex for code symbols, methods, handlers, or concrete strings inside files. Use `|` for alternatives. Do not use `path:foo.rs` or wildcard-only queries like `*`; use find_file_tool for filename lookup."},
-                            "glob": {"type": "string", "description": "Optional glob filter (e.g. `*.rs`)."},
-                            "path": {"type": "string", "description": "Optional path scope (e.g. `src/acp.rs`)."}
+                            "query": {"type": "string", "description": "Ripgrep regex. Join alternate terms with `|`."},
+                            "glob": {"type": "string", "description": "Optional glob filter."},
+                            "path": {"type": "string", "description": "Optional path scope."}
                         },
                         "required": ["query"]
                     }
@@ -139,12 +155,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "find_file_tool",
-                    "description": "Find file paths by filename, path, extension, or glob. Use this, not search_code_tool, when locating files. Set `include_metadata: true` for small result sets when line counts or file sizes would help choose targeted reads, larger read_file_tool limits, or consecutive reads. Metadata is bounded and omitted for large result sets.\n\nExamples: `**/*.rs`, `src/acp*`, `**/Cargo.toml`. The pattern may contain `|` for multiple alternatives, e.g. `src/acp.rs|src/agent_loop.rs`.",
+                    "description": "Find file paths by glob; use `|` to try multiple patterns.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "pattern": {"type": "string", "description": "Glob pattern to match files. Examples: `**/*.rs`, `src/acp*`, `**/Cargo.toml`, or `src/acp.rs|src/agent_loop.rs`."},
-                            "include_metadata": {"type": "boolean", "description": "When true, return JSON with path, size_bytes, and line_count for small result sets. Use this to decide read_file_tool limits; otherwise leave false for plain path output."}
+                            "pattern": {"type": "string", "description": "Glob pattern or pipe-separated alternatives."},
+                            "include_metadata": {"type": "boolean", "description": "Include small-file metadata."}
                         },
                         "required": ["pattern"]
                     }
@@ -154,12 +170,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "web_search_tool",
-                    "description": "Search the web and return titles, URLs, and snippets.\n\nUse this to find documentation, bug reports, references, or relevant pages before using web_fetch_tool.",
+                    "description": "Search the web.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {"type": "string", "description": "Search query."},
-                            "max_results": {"type": "integer", "description": "Maximum number of results to return (default 5)."}
+                            "max_results": {"type": "integer", "description": "Maximum number of results."}
                         },
                         "required": ["query"]
                     }
@@ -169,11 +185,11 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "web_fetch_tool",
-                    "description": "Fetch a URL and return readable text content.\n\nUse this to read documentation, API specs, GitHub pages, health endpoints, or any URL the user references.",
+                    "description": "Fetch a URL.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "url": {"type": "string", "description": "URL to fetch."}
+                            "url": {"type": "string", "description": "URL."}
                         },
                         "required": ["url"]
                     }
@@ -183,11 +199,11 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "run_command_tool",
-                    "description": "Run a shell command inside the current workspace.\n\nUse this for git, rg, tests, builds, linting, Flutter/Dart/Node commands, and deploy scripts when needed.\nDestructive commands (sudo, shutdown, git reset --hard, etc.) are blocked at the system level and will always fail regardless of user request.",
+                    "description": "Run a shell command in the workspace.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "cmd": {"type": "string", "description": "Shell command to execute."}
+                            "cmd": {"type": "string", "description": "Shell command."}
                         },
                         "required": ["cmd"]
                     }
@@ -197,7 +213,7 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "list_command_sessions_tool",
-                    "description": "List active command sessions in the workspace.\n\nUse this to see running terminal sessions, inspect their commands, and decide whether to read or terminate one.",
+                    "description": "List active command sessions.",
                     "parameters": {
                         "type": "object",
                         "properties": {}
@@ -208,11 +224,11 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "start_command_session_tool",
-                    "description": "Start a persistent shell command session in the workspace.\n\nUse this when the user wants to follow a running command, tail logs, watch output, or interact with a process over time.",
+                    "description": "Start a persistent shell session.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "cmd": {"type": "string", "description": "Shell command to run in the session."}
+                            "cmd": {"type": "string", "description": "Shell command."}
                         },
                         "required": ["cmd"]
                     }
@@ -222,12 +238,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "read_command_session_tool",
-                    "description": "Read new output from a previously started command session.",
+                    "description": "Read output from a command session.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "session_id": {"type": "string", "description": "Session ID returned by start_command_session_tool."},
-                            "max_chars": {"type": "integer", "description": "Maximum characters to return (default 4000)."}
+                            "session_id": {"type": "string", "description": "Session ID."},
+                            "max_chars": {"type": "integer", "description": "Maximum characters."}
                         },
                         "required": ["session_id"]
                     }
@@ -237,12 +253,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "write_command_session_tool",
-                    "description": "Write stdin to a running command session.",
+                    "description": "Write stdin to a command session.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "session_id": {"type": "string", "description": "Session ID."},
-                            "chars": {"type": "string", "description": "Characters to write to stdin."}
+                            "chars": {"type": "string", "description": "Characters to write."}
                         },
                         "required": ["session_id", "chars"]
                     }
@@ -252,12 +268,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "terminate_command_session_tool",
-                    "description": "Terminate a running command session.",
+                    "description": "Terminate a command session.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "session_id": {"type": "string", "description": "Session ID."},
-                            "kill": {"type": "boolean", "description": "Use SIGKILL instead of SIGTERM."}
+                            "kill": {"type": "boolean", "description": "Kill forcefully."}
                         },
                         "required": ["session_id"]
                     }
@@ -267,14 +283,14 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "patch_file_tool",
-                    "description": "Apply a targeted text patch to an existing file.\n\nUse this when you know the exact snippet to replace and want a safer scoped edit than rewriting the entire file.\nRead or search the file first so the patch target is precise. Keep patches small: replace a single expression, helper, or adjacent block instead of an entire function whenever possible.\nWhen adding code or tests, preserve neighboring blocks and insert adjacent to related code; do not replace an existing test/function unless the user explicitly asked for replacement.\nIMPORTANT: old_text must be verbatim file content. The `N: ` line-number prefixes shown in read_file_tool output are display-only and must never appear in old_text.",
+                    "description": "Apply a targeted patch to a file.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Path to the file to patch, relative to the workspace root."},
-                            "old_text": {"type": "string", "description": "Exact existing text to replace. Keep this small and scoped; do not paste an entire function unless unavoidable."},
-                            "new_text": {"type": "string", "description": "Replacement text. Keep this small and scoped; prefer adding a helper plus one call-site change over rewriting a whole function."},
-                            "replace_all": {"type": "boolean", "description": "Whether to replace every occurrence instead of just one."}
+                            "path": {"type": "string", "description": "File path."},
+                            "old_text": {"type": "string", "description": "Exact text to replace."},
+                            "new_text": {"type": "string", "description": "Replacement text."},
+                            "replace_all": {"type": "boolean", "description": "Replace every occurrence."}
                         },
                         "required": ["path", "old_text", "new_text"]
                     }
@@ -284,12 +300,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "delete_path_tool",
-                    "description": "Delete a file, symlink, or directory in the workspace.\n\nUse this when the user explicitly asks to delete or remove a path.\nFor non-empty directories, set recursive=true only when the request clearly requires it.",
+                    "description": "Delete a file or directory.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Path to delete, relative to the workspace root."},
-                            "recursive": {"type": "boolean", "description": "Delete non-empty directories recursively when true."}
+                            "path": {"type": "string", "description": "Path."},
+                            "recursive": {"type": "boolean", "description": "Delete directories recursively."}
                         },
                         "required": ["path"]
                     }
@@ -299,12 +315,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "edit_file_tool",
-                    "description": "Rewrite an entire small existing file in the workspace.\n\nDo not use this for targeted edits, appends, refactors inside large files, or changes where exact old/new text can be identified. Prefer patch_file_tool for those cases.",
+                    "description": "Rewrite a small existing file.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Path to the file to edit, relative to the workspace root."},
-                            "instruction": {"type": "string", "description": "What to change in the file."}
+                            "path": {"type": "string", "description": "File path."},
+                            "instruction": {"type": "string", "description": "Edit instruction."}
                         },
                         "required": ["path", "instruction"]
                     }
@@ -314,13 +330,13 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "create_artifact_tool",
-                    "description": "Create and write a new file in the workspace.\n\nUse this whenever the user asks to create, make, write, save, or generate a file, note, document, config, or code artifact.\nAlways pass filename when the user names an exact file or path. Use the exact filename the user requested — do not invent or substitute a different path.\nDo not put only the desired file contents in instruction and omit filename.\nDo not answer with the file contents directly when this tool should be used.\nIf the user specified a length limit (\"short\", \"brief\", \"under N lines\"), include it in instruction.",
+                    "description": "Create a new file.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "instruction": {"type": "string", "description": "What the file should contain."},
-                            "filename": {"type": "string", "description": "Filename or relative path to create. Required when the user names an exact file or path."},
-                            "kind": {"type": "string", "description": "Optional file kind hint: markdown, json, dart, python, yaml, text."}
+                            "instruction": {"type": "string", "description": "File contents."},
+                            "filename": {"type": "string", "description": "Filename or path."},
+                            "kind": {"type": "string", "description": "Optional file kind hint."}
                         },
                         "required": ["instruction"]
                     }
@@ -364,10 +380,104 @@ impl BuiltinToolRegistry {
         Ok(file_chunk_lines(&content, start_line, limit, Some(path)))
     }
 
+    fn invoke_read_source_tree(&self, arguments: Map<String, Value>) -> Result<String> {
+        let path = required_string(&arguments, "path")?;
+        let max_files = arguments
+            .get("max_files")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(40)
+            .clamp(1, 100);
+        let per_file_line_limit = arguments
+            .get("per_file_line_limit")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(260)
+            .clamp(1, 1000);
+
+        let directory = fs::safe_path(&self.workspace_cwd, path)?;
+        if !directory.is_dir() {
+            bail!("read_source_tree_tool path is not a directory: {path}");
+        }
+
+        let mut files = Vec::new();
+        collect_source_tree_files(&directory, &mut files)?;
+        files.sort();
+
+        let mut omitted_files = Vec::new();
+        if files.len() > max_files {
+            omitted_files = files.split_off(max_files);
+        }
+
+        let mut file_outputs = Vec::new();
+        let mut files_read = Vec::new();
+        for absolute in files {
+            let relative = absolute
+                .strip_prefix(&self.workspace_cwd)
+                .unwrap_or(&absolute)
+                .display()
+                .to_string();
+            let content = std::fs::read_to_string(&absolute)
+                .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", relative))?;
+            let total_lines = content.lines().count();
+            let complete = total_lines <= per_file_line_limit;
+            let chunk = file_chunk_lines(&content, 1, per_file_line_limit, Some(&relative));
+            files_read.push(relative.clone());
+            file_outputs.push(json!({
+                "path": relative,
+                "total_lines": total_lines,
+                "line_limit": per_file_line_limit,
+                "complete": complete,
+                "content": chunk,
+                "next_start_line": if complete { Value::Null } else { json!(per_file_line_limit + 1) },
+            }));
+        }
+
+        let omitted_files = omitted_files
+            .iter()
+            .map(|absolute| {
+                absolute
+                    .strip_prefix(&self.workspace_cwd)
+                    .unwrap_or(absolute)
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let complete = omitted_files.is_empty()
+            && file_outputs
+                .iter()
+                .all(|file| file["complete"].as_bool().unwrap_or(false));
+
+        Ok(json!({
+            "tool": "read_source_tree_tool",
+            "path": path,
+            "files_read": files_read,
+            "files": file_outputs,
+            "complete": complete,
+            "omitted_files": omitted_files,
+        })
+        .to_string())
+    }
+
     fn invoke_list_dir(&self, arguments: Map<String, Value>) -> Result<String> {
         let path = optional_string(&arguments, "path").unwrap_or(".");
         let entries = fs::list_dir(&self.workspace_cwd, path)?;
-        Ok(entries.join("\n"))
+        let quoted_entries = entries
+            .iter()
+            .map(|name| {
+                json!({
+                    "name": name,
+                    "quoted": quote_for_display(name),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "path": path,
+            "entries": quoted_entries,
+            "count": entries.len(),
+            "hint": "Use the exact `name` value as the path argument. Preserve punctuation and leading characters exactly as shown."
+        })
+        .to_string())
     }
 
     fn invoke_search_code(&self, arguments: Map<String, Value>) -> Result<String> {
@@ -569,6 +679,13 @@ impl BuiltinToolRegistry {
     fn invoke_delete_path(&self, arguments: Map<String, Value>) -> Result<String> {
         let path = required_string(&arguments, "path")?;
         let recursive = optional_bool(&arguments, "recursive").unwrap_or(false);
+        let target = fs::safe_path(&self.workspace_cwd, path)?;
+        if !target.exists() {
+            bail!(
+                "{}",
+                delete_path_diagnostic_error(path, recursive, &self.workspace_cwd)
+            );
+        }
         let deleted = fs::delete_path(&self.workspace_cwd, path, recursive)?;
         self.emit_progress(ToolProgressEvent::FileModified {
             path: deleted.clone(),
@@ -739,6 +856,7 @@ impl ToolExecutor for BuiltinToolRegistry {
     async fn invoke(&self, name: &str, arguments: Map<String, Value>) -> Result<String> {
         match name {
             "read_file_tool" => self.invoke_read_file(arguments),
+            "read_source_tree_tool" => self.invoke_read_source_tree(arguments),
             "list_dir_tool" => self.invoke_list_dir(arguments),
             "search_code_tool" => self.invoke_search_code(arguments),
             "find_file_tool" => self.invoke_find_file(arguments),
@@ -1036,14 +1154,8 @@ fn file_chunk_lines(content: &str, start_line: usize, limit: usize, path: Option
         metadata.insert("truncated".to_owned(), Value::Bool(true));
         metadata.insert("next_start_line".to_owned(), json!(next_start_line));
         metadata.insert("remaining_lines".to_owned(), json!(total - to));
-        metadata.insert(
-            "continuation_hint".to_owned(),
-            Value::String(format!(
-                "This read is partial. Continue with read_file_tool start_line={next_start_line} if the current function, block, file, or requested boundary is incomplete. Do not state that the whole file was read unless a read result reaches end of file."
-            )),
-        );
         serde_json::to_string_pretty(&Value::Object(metadata))
-            .unwrap_or_else(|_| format!("{chunk}\n[Continue at {next_start_line}.]"))
+            .unwrap_or_else(|_| format!("{chunk}\n[truncated]"))
     }
 }
 
@@ -1053,6 +1165,52 @@ fn format_file_line(line_number: usize, line: &str) -> String {
 
 fn file_preview(content: &str) -> String {
     file_chunk_lines(content, 1, 80, None)
+}
+
+fn collect_source_tree_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(directory)
+        .map_err(|error| anyhow::anyhow!("failed to list {}: {error}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if fs::IGNORED_LIST_DIR_NAMES.contains(&name) || name.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_source_tree_files(&path, files)?;
+        } else if is_source_tree_text_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_source_tree_text_file(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension,
+        "rs" | "md"
+            | "toml"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "txt"
+            | "py"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "html"
+            | "css"
+            | "sh"
+    )
 }
 
 fn render_find_file_metadata(cwd: &Path, pattern: &str, paths: &[String]) -> String {
@@ -1086,9 +1244,13 @@ fn render_find_file_metadata(cwd: &Path, pattern: &str, paths: &[String]) -> Str
         "pattern": pattern,
         "metadata_included": true,
         "files": files,
-        "hint": "Use line_count to choose targeted reads, larger read_file_tool limits, or consecutive reads. The default read_file_tool limit is one page, not whole-file evidence."
+        "hint": "Use line_count as a planning aid: narrow lookups can stay targeted, while broad understanding may justify larger read_file_tool limits or consecutive reads."
     })
     .to_string()
+}
+
+fn quote_for_display(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
 }
 
 fn read_file_diagnostic_error(
@@ -1161,6 +1323,24 @@ fn search_code_wrong_tool_diagnostic(query: &str) -> Option<String> {
         })
         .to_string(),
     )
+}
+
+fn delete_path_diagnostic_error(path: &str, recursive: bool, cwd: &Path) -> String {
+    let suggestion = suggest_workspace_path(cwd, path);
+    json!({
+        "code": "delete_path_not_found",
+        "message": format!("delete_path_tool path not found: {path}"),
+        "diagnostics": {
+            "path": path,
+            "quoted_path": quote_for_display(path),
+            "recursive": recursive,
+            "cwd": cwd.display().to_string(),
+            "suggested_path": suggestion,
+            "path_exists": cwd.join(path).exists(),
+            "next_step": "Re-run list_dir_tool or find_file_tool and use the exact returned name. Do not infer or strip punctuation."
+        }
+    })
+    .to_string()
 }
 
 fn patch_diagnostic_error(
@@ -1310,14 +1490,6 @@ fn optional_bool(arguments: &Map<String, Value>, key: &str) -> Option<bool> {
     arguments.get(key).and_then(Value::as_bool)
 }
 
-fn ceil_char_boundary(text: &str, index: usize) -> usize {
-    let mut index = index.min(text.len());
-    while index < text.len() && !text.is_char_boundary(index) {
-        index += 1;
-    }
-    index
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1330,7 +1502,7 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -1396,26 +1568,13 @@ mod tests {
     impl crate::agent_loop::ModelClient for MockModel {
         async fn complete(
             &self,
-            messages: &[ChatMessage],
+            _messages: &[ChatMessage],
             _tools: &[serde_json::Value],
             _max_tokens: u32,
             _temperature: f32,
             _think_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
             _answer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         ) -> Result<crate::mlx_client::CompletionResult> {
-            if messages.iter().any(|message| {
-                message.role == "system"
-                    && message
-                        .content
-                        .as_deref()
-                        .unwrap_or_default()
-                        .contains("Task contract classifier")
-            }) {
-                return Ok(text_result(
-                    r#"{"goal":"test task","allowed_to_answer_without_tools":true,"final_conditions":[],"failure_policy":"none"}"#,
-                ));
-            }
-
             self.responses
                 .lock()
                 .await
@@ -1437,6 +1596,7 @@ mod tests {
             names,
             vec![
                 "read_file_tool",
+                "read_source_tree_tool",
                 "list_dir_tool",
                 "search_code_tool",
                 "find_file_tool",
@@ -1453,6 +1613,71 @@ mod tests {
                 "edit_file_tool",
                 "create_artifact_tool",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_source_tree_tool_reads_multiple_text_files() {
+        let tempdir = TempDir::new().expect("tempdir");
+        stdfs::create_dir_all(tempdir.path().join("src/nested")).expect("mkdir");
+        stdfs::write(tempdir.path().join("src/main.rs"), "fn main() {}\n").expect("write main");
+        stdfs::write(
+            tempdir.path().join("src/nested/lib.rs"),
+            "pub fn lib() {}\n",
+        )
+        .expect("write lib");
+        stdfs::write(tempdir.path().join("src/image.bin"), [0, 1, 2]).expect("write bin");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+
+        let result = registry
+            .invoke(
+                "read_source_tree_tool",
+                json!({"path": "src", "per_file_line_limit": 20})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            )
+            .await
+            .expect("invoke");
+        let parsed: Value = serde_json::from_str(&result).expect("json result");
+
+        assert_eq!(parsed["path"], "src");
+        assert_eq!(parsed["files_read"].as_array().unwrap().len(), 2);
+        assert!(result.contains("src/main.rs"));
+        assert!(result.contains("src/nested/lib.rs"));
+        assert!(!result.contains("image.bin"));
+    }
+
+    #[test]
+    fn list_dir_tool_returns_structured_entries_with_quoted_names() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        stdfs::create_dir_all(tempdir.path().join("normal")).expect("mkdir");
+        stdfs::create_dir_all(tempdir.path().join("`.gemma")).expect("mkdir weird");
+
+        let result = futures::executor::block_on(
+            registry.invoke(
+                "list_dir_tool",
+                json!({"path": "."}).as_object().cloned().unwrap(),
+            ),
+        )
+        .expect("invoke");
+        let parsed: Value = serde_json::from_str(&result).expect("json result");
+
+        assert_eq!(parsed["path"], ".");
+        assert!(parsed["count"].as_u64().unwrap() >= 2);
+        assert!(
+            parsed["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| entry["name"] == "`.gemma" && entry["quoted"] == "\"`.gemma\"")
+        );
+        assert!(
+            parsed["hint"]
+                .as_str()
+                .expect("hint")
+                .contains("Preserve punctuation")
         );
     }
 
@@ -1474,14 +1699,9 @@ mod tests {
                 .as_str()
                 .expect("limit description");
 
-        assert!(description.contains("Default `limit` is 200"));
-        assert!(description.contains("callers may request a larger limit"));
-        assert!(description.contains("prefer search_code_tool first"));
-        assert!(description.contains("complete: false"));
-        assert!(description.contains("remaining_lines"));
-        assert!(description.contains("Do not claim a whole file was read"));
-        assert!(limit_description.contains("Use a larger value"));
-        assert!(limit_description.contains("otherwise keep reads targeted"));
+        assert!(description.contains("Read workspace file lines"));
+        assert!(limit_description.contains("Maximum lines to return"));
+        assert!(limit_description.contains("broad understanding"));
     }
 
     #[test]
@@ -1499,29 +1719,14 @@ mod tests {
             .expect("description");
 
         assert!(description.contains("Search file contents with ripgrep"));
-        assert!(description.contains("Do not use for filename/path lookup"));
-        assert!(description.contains("use find_file_tool for that"));
-        assert!(description.contains("Results are candidates only"));
-        assert!(description.contains("read files before code claims"));
-        assert!(description.contains("Search snippets are not source-read evidence"));
-        assert!(description.contains("do not count as having read a file"));
-        assert!(
-            description
-                .contains("call read_file_tool for each relevant function/block before citing")
-        );
-        assert!(description.contains("valid ripgrep regex"));
-        assert!(description.contains("Do not use wildcard-only queries"));
-        assert!(description.contains("fn|struct|impl"));
+        assert!(description.contains("`|` to join alternate terms"));
 
         let query_description =
             search_schema["function"]["parameters"]["properties"]["query"]["description"]
                 .as_str()
                 .expect("query description");
-        assert!(query_description.contains("Valid ripgrep regex"));
-        assert!(query_description.contains("inside files"));
-        assert!(query_description.contains("Do not use `path:foo.rs`"));
-        assert!(query_description.contains("use find_file_tool"));
-        assert!(query_description.contains("wildcard-only queries"));
+        assert!(query_description.contains("Ripgrep regex"));
+        assert!(query_description.contains("`|`"));
     }
 
     #[test]
@@ -1542,14 +1747,8 @@ mod tests {
                 .as_str()
                 .expect("include_metadata description");
 
-        assert!(description.contains("include_metadata: true"));
-        assert!(description.contains("Find file paths"));
-        assert!(description.contains("Use this, not search_code_tool"));
-        assert!(description.contains("line counts or file sizes"));
-        assert!(description.contains("choose targeted reads"));
-        assert!(description.contains("Metadata is bounded"));
-        assert!(metadata_description.contains("path, size_bytes, and line_count"));
-        assert!(metadata_description.contains("read_file_tool limits"));
+        assert!(description.contains("Find file paths by glob"));
+        assert!(metadata_description.contains("Include small-file metadata"));
     }
 
     // -----------------------------------------------------------------------
@@ -2174,18 +2373,6 @@ Body text.
         assert_eq!(page1_json["next_start_line"], 201);
         assert_eq!(page1_json["remaining_lines"], 250);
         assert!(
-            page1_json["continuation_hint"]
-                .as_str()
-                .expect("continuation hint")
-                .contains("This read is partial")
-        );
-        assert!(
-            page1_json["continuation_hint"]
-                .as_str()
-                .expect("continuation hint")
-                .contains("whole file was read")
-        );
-        assert!(
             page1_json["content"]
                 .as_str()
                 .expect("content")
@@ -2316,6 +2503,36 @@ Body text.
     }
 
     #[test]
+    fn delete_path_tool_reports_structured_missing_path_diagnostics() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+
+        let err = futures::executor::block_on(
+            registry.invoke(
+                "delete_path_tool",
+                json!({"path": "`.gemma", "recursive": true})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
+        .expect_err("missing delete target should error with diagnostics");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&err.to_string()).expect("structured delete error");
+        assert_eq!(parsed["code"], "delete_path_not_found");
+        assert_eq!(parsed["diagnostics"]["path"], "`.gemma");
+        assert_eq!(parsed["diagnostics"]["quoted_path"], "\"`.gemma\"");
+        assert_eq!(parsed["diagnostics"]["path_exists"], false);
+        assert!(
+            parsed["diagnostics"]["next_step"]
+                .as_str()
+                .expect("next step")
+                .contains("exact returned name")
+        );
+    }
+
+    #[test]
     fn search_code_tool_accepts_pipe_separated_paths() {
         let tempdir = TempDir::new().expect("tempdir");
         let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
@@ -2437,7 +2654,7 @@ Body text.
             parsed["hint"]
                 .as_str()
                 .expect("hint")
-                .contains("default read_file_tool limit is one page")
+                .contains("planning aid")
         );
     }
 

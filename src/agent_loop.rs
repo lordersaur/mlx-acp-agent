@@ -1,7 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
-use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::mlx_client::{
@@ -10,11 +9,14 @@ use crate::mlx_client::{
 use crate::model_parser::extract_thought_blocks;
 
 pub const SYSTEM_PROMPT: &str = "\
-You are a coding agent.
-Use tools for code-grounded claims.
-Search snippets are not source-read evidence.
-Keep internal reasoning private.
-Do not write Gemma control tokens, ACP thinking tags, or prose tool-call displays in user-visible answers.
+You are a coding agent called Gemma 4.
+Use tools for source-backed claims.
+Keep reasoning private.
+For broad file or module explanations, read the file or read sequential chunks before searching.
+For narrow symbol or exact-text lookups, search first with pipe-separated alternate terms, then read the relevant lines.
+Use line counts only as a planning aid when choosing read size.
+Do not write Gemma control tokens, ACP thinking tags, or tool-call displays in user-visible answers.
+If unsure, say so.
 ";
 // ---------------------------------------------------------------------------
 // Public types
@@ -71,10 +73,10 @@ pub struct AgentLoopOptions {
 impl Default for AgentLoopOptions {
     fn default() -> Self {
         Self {
-            max_iterations: 15,
+            max_iterations: 25,
             max_tokens: 2500,
             temperature: 1.0,
-            max_parallel_tool_calls: 3,
+            max_parallel_tool_calls: 6,
         }
     }
 }
@@ -166,7 +168,6 @@ pub async fn run_agent_loop(
 ) -> Result<LoopResult> {
     let mut all_tool_results: Vec<ToolExecution> = Vec::new();
     let mut answer_streamed = false;
-    let turn_contract = generate_turn_contract(model, messages, tools.tool_names()).await;
 
     // Build the initial conversation as proper ChatMessages.
     let mut conversation: Vec<ChatMessage> = Vec::new();
@@ -258,12 +259,6 @@ pub async fn run_agent_loop(
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_default();
 
-            let evidence = EvidenceLedger::from_tool_results(&all_tool_results);
-            if let Some(instruction) = turn_contract.unmet_final_answer_instruction(&evidence) {
-                conversation.push(ChatMessage::user(instruction));
-                continue;
-            }
-
             if let Some(handler) = on_thought.as_deref_mut() {
                 for chunk in &answer_chunks {
                     answer_streamed = true;
@@ -292,11 +287,12 @@ pub async fn run_agent_loop(
         // The model may request many calls at once; we silently truncate to
         // options.max_parallel_tool_calls so the conversation stays consistent —
         // the model will call the remaining tools in the next iteration.
-        let tool_calls = if result.tool_calls.len() > options.max_parallel_tool_calls {
-            &result.tool_calls[..options.max_parallel_tool_calls]
-        } else {
-            &result.tool_calls[..]
-        };
+        let tool_calls: Vec<ApiToolCall> =
+            if result.tool_calls.len() > options.max_parallel_tool_calls {
+                result.tool_calls[..options.max_parallel_tool_calls].to_vec()
+            } else {
+                result.tool_calls.clone()
+            };
 
         // Push assistant message with structured tool_calls.
         let chat_tool_calls: Vec<ChatToolCall> = tool_calls
@@ -315,7 +311,7 @@ pub async fn run_agent_loop(
 
         // Execute tools (parallel when multiple), but avoid repeating the exact
         // same failing call indefinitely.
-        let executions = execute_tools(tool_calls, tools, &all_tool_results).await;
+        let executions = execute_tools(&tool_calls, tools, &all_tool_results).await;
         all_tool_results.extend(executions.iter().cloned());
 
         // Push tool result messages with matching tool_call_id.
@@ -330,380 +326,6 @@ pub async fn run_agent_loop(
         iterations: options.max_iterations,
         answer_streamed,
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TurnContract {
-    goal: String,
-    allowed_to_answer_without_tools: bool,
-    final_conditions: Vec<FinalCondition>,
-    failure_policy: String,
-}
-
-impl TurnContract {
-    fn fallback(messages: &[ConversationMessage]) -> Self {
-        Self {
-            goal: latest_user_task(messages),
-            allowed_to_answer_without_tools: true,
-            final_conditions: Vec::new(),
-            failure_policy: "If required evidence is missing, say what is missing.".to_owned(),
-        }
-    }
-
-    fn unmet_final_answer_instruction(&self, evidence: &EvidenceLedger) -> Option<String> {
-        if self.allowed_to_answer_without_tools && self.final_conditions.is_empty() {
-            return None;
-        }
-
-        let unmet: Vec<String> = self
-            .final_conditions
-            .iter()
-            .filter(|condition| !evidence.satisfies(condition))
-            .map(FinalCondition::retry_label)
-            .collect();
-
-        if unmet.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "The current task has unmet final-answer conditions. Goal: {}. Missing evidence: {}. Continue with the needed tool calls, then answer only from verified tool evidence. Failure policy: {}",
-                self.goal,
-                unmet.join("; "),
-                self.failure_policy
-            ))
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FinalCondition {
-    SourceRead { path_hint: Option<String> },
-    WebSearch { query_hint: Option<String> },
-    Write { path_hint: Option<String> },
-    Command { command_hint: Option<String> },
-}
-
-impl FinalCondition {
-    fn retry_label(&self) -> String {
-        match self {
-            FinalCondition::SourceRead { path_hint } => match path_hint {
-                Some(path) => format!("successful read_file_tool evidence for `{path}`"),
-                None => "successful read_file_tool evidence".to_owned(),
-            },
-            FinalCondition::WebSearch { query_hint } => match query_hint {
-                Some(query) => format!("successful web_search_tool evidence for `{query}`"),
-                None => "successful web_search_tool evidence".to_owned(),
-            },
-            FinalCondition::Write { path_hint } => match path_hint {
-                Some(path) => format!("successful write-tool evidence for `{path}`"),
-                None => "successful write-tool evidence".to_owned(),
-            },
-            FinalCondition::Command { command_hint } => match command_hint {
-                Some(command) => format!("successful run_command_tool evidence for `{command}`"),
-                None => "successful run_command_tool evidence".to_owned(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct EvidenceLedger {
-    successful_read_paths: Vec<String>,
-    successful_web_queries: Vec<String>,
-    successful_write_paths: Vec<String>,
-    successful_commands: Vec<String>,
-}
-
-impl EvidenceLedger {
-    fn from_tool_results(tool_results: &[ToolExecution]) -> Self {
-        let mut ledger = Self::default();
-
-        for result in tool_results.iter().filter(|result| !result.error) {
-            match result.name.as_str() {
-                "read_file_tool" => {
-                    if let Some(path) = string_arg(&result.arguments, "path") {
-                        if !path.is_empty() {
-                            ledger.successful_read_paths.push(normalize_path_hint(path));
-                        }
-                    }
-                }
-                "web_search_tool" => {
-                    if let Some(query) = string_arg(&result.arguments, "query") {
-                        if !query.is_empty() {
-                            ledger
-                                .successful_web_queries
-                                .push(normalize_text_hint(query));
-                        }
-                    }
-                }
-                "web_fetch_tool" => {
-                    if let Some(url) = string_arg(&result.arguments, "url") {
-                        if !url.is_empty() {
-                            ledger.successful_web_queries.push(normalize_text_hint(url));
-                        }
-                    }
-                }
-                "create_artifact_tool"
-                | "edit_file_tool"
-                | "patch_file_tool"
-                | "delete_path_tool" => {
-                    if let Some(path) = write_path_from_execution(result) {
-                        ledger
-                            .successful_write_paths
-                            .push(normalize_path_hint(&path));
-                    }
-                }
-                "run_command_tool" | "start_command_session_tool" => {
-                    if let Some(cmd) = string_arg(&result.arguments, "cmd") {
-                        if !cmd.is_empty() {
-                            ledger.successful_commands.push(normalize_text_hint(cmd));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        ledger
-    }
-
-    fn satisfies(&self, condition: &FinalCondition) -> bool {
-        match condition {
-            FinalCondition::SourceRead { path_hint } => match path_hint {
-                Some(hint) => self.has_read_matching(hint),
-                None => !self.successful_read_paths.is_empty(),
-            },
-            FinalCondition::WebSearch { query_hint } => match query_hint {
-                Some(hint) => self.has_web_matching(hint),
-                None => !self.successful_web_queries.is_empty(),
-            },
-            FinalCondition::Write { path_hint } => match path_hint {
-                Some(hint) => self.has_write_matching(hint),
-                None => !self.successful_write_paths.is_empty(),
-            },
-            FinalCondition::Command { command_hint } => match command_hint {
-                Some(hint) => self.has_command_matching(hint),
-                None => !self.successful_commands.is_empty(),
-            },
-        }
-    }
-
-    fn has_read_matching(&self, path_hint: &str) -> bool {
-        let hint = normalize_path_hint(path_hint);
-        self.successful_read_paths.iter().any(|path| {
-            path == &hint || path.ends_with(&format!("/{hint}")) || hint.ends_with(path)
-        })
-    }
-
-    fn has_write_matching(&self, path_hint: &str) -> bool {
-        let hint = normalize_path_hint(path_hint);
-        self.successful_write_paths.iter().any(|path| {
-            path == &hint || path.ends_with(&format!("/{hint}")) || hint.ends_with(path)
-        })
-    }
-
-    fn has_web_matching(&self, query_hint: &str) -> bool {
-        let hint = normalize_text_hint(query_hint);
-        self.successful_web_queries
-            .iter()
-            .any(|query| query.contains(&hint) || hint.contains(query))
-    }
-
-    fn has_command_matching(&self, command_hint: &str) -> bool {
-        let hint = normalize_text_hint(command_hint);
-        self.successful_commands
-            .iter()
-            .any(|cmd| cmd.contains(&hint) || hint.contains(cmd))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ContractEnvelope {
-    goal: Option<String>,
-    allowed_to_answer_without_tools: Option<bool>,
-    final_conditions: Option<Vec<ContractCondition>>,
-    failure_policy: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ContractCondition {
-    #[serde(rename = "type")]
-    kind: String,
-    path_hint: Option<String>,
-    query_hint: Option<String>,
-    command_hint: Option<String>,
-}
-
-async fn generate_turn_contract(
-    model: &dyn ModelClient,
-    messages: &[ConversationMessage],
-    tool_names: Vec<String>,
-) -> TurnContract {
-    let task = latest_user_task(messages);
-    let recent_context = recent_contract_context(messages);
-    let prompt = format!(
-        "Current user task:\n{task}\n\nRecent conversation context:\n{recent_context}\n\nAvailable tools:\n{}",
-        tool_names.join(", ")
-    );
-    let contract_messages = [
-        ChatMessage::system(
-            "mode_prompt: fast\nTask contract classifier for a local coding agent. Return raw JSON only, with no Markdown fences and no explanation. Schema: {\"goal\":string,\"allowed_to_answer_without_tools\":boolean,\"final_conditions\":[{\"type\":\"source_read\"|\"web_search\"|\"write\"|\"command\"|\"none\",\"path_hint\":string|null,\"query_hint\":string|null,\"command_hint\":string|null,\"reason\":string}],\"failure_policy\":string}.\n\nChoose final conditions needed before the agent may give a final answer. Prior conversation matters: references like \"this\", \"that\", \"the one we discussed\", \"the plan\", and \"this agent\" inherit the recent topic.\n\nRules:\n- Treat filenames, paths, extensions, symbols, code behavior, and repository/project-specific questions as local workspace tasks first.\n- For local code/file behavior questions, project-specific architecture plans, or critiques of prior codebase analysis, require source_read and set path_hint to the named file/path/symbol when possible.\n- Search snippets are not source-read evidence; source_read means read_file_tool evidence.\n- If the user explicitly asks to search the internet/web, or asks for current/latest external information, require web_search and set query_hint when possible.\n- If the user asks to modify/create/delete files, require write and set path_hint when possible.\n- If the user asks to run tests, builds, diagnostics, commands, or verification, require command and set command_hint when possible.\n- Use none only for casual chat or genuinely general advice not tied to the local project or recent repo-specific discussion.",
-        ),
-        ChatMessage::user(prompt),
-    ];
-
-    let Ok(result) = model
-        .complete(&contract_messages, &[], 450, 0.0, None, None)
-        .await
-    else {
-        return TurnContract::fallback(messages);
-    };
-
-    let Some(content) = result.content else {
-        return TurnContract::fallback(messages);
-    };
-
-    parse_turn_contract(&content).unwrap_or_else(|| TurnContract::fallback(messages))
-}
-
-fn parse_turn_contract(content: &str) -> Option<TurnContract> {
-    let (_thoughts, clean) = extract_thought_blocks(content);
-    let json_text = extract_json_object(&clean)?;
-    let parsed: ContractEnvelope = serde_json::from_str(json_text).ok()?;
-    let final_conditions = parsed
-        .final_conditions
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|condition| match condition.kind.as_str() {
-            "source_read" => Some(FinalCondition::SourceRead {
-                path_hint: condition.path_hint.filter(|s| !s.trim().is_empty()),
-            }),
-            "web_search" => Some(FinalCondition::WebSearch {
-                query_hint: condition.query_hint.filter(|s| !s.trim().is_empty()),
-            }),
-            "write" => Some(FinalCondition::Write {
-                path_hint: condition.path_hint.filter(|s| !s.trim().is_empty()),
-            }),
-            "command" => Some(FinalCondition::Command {
-                command_hint: condition.command_hint.filter(|s| !s.trim().is_empty()),
-            }),
-            "none" => None,
-            _ => None,
-        })
-        .collect();
-
-    Some(TurnContract {
-        goal: parsed.goal.unwrap_or_default(),
-        allowed_to_answer_without_tools: parsed.allowed_to_answer_without_tools.unwrap_or(false),
-        final_conditions,
-        failure_policy: parsed
-            .failure_policy
-            .unwrap_or_else(|| "If required evidence is missing, say what is missing.".to_owned()),
-    })
-}
-
-fn extract_json_object(content: &str) -> Option<&str> {
-    let start = content.find('{')?;
-    let end = content.rfind('}')?;
-    (start <= end).then_some(&content[start..=end])
-}
-
-fn latest_user_task(messages: &[ConversationMessage]) -> String {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .map(|message| extract_current_task(&message.content))
-        .unwrap_or_default()
-}
-
-fn recent_contract_context(messages: &[ConversationMessage]) -> String {
-    let mut items: Vec<String> = messages
-        .iter()
-        .rev()
-        .filter(|message| message.role == "user" || message.role == "assistant")
-        .take(8)
-        .map(|message| {
-            let content = if message.role == "user" {
-                extract_current_task(&message.content)
-            } else {
-                message.content.trim().to_owned()
-            };
-            format!(
-                "{}: {}",
-                message.role,
-                truncate_for_contract_context(&content, 700)
-            )
-        })
-        .collect();
-    items.reverse();
-
-    if items.is_empty() {
-        "(none)".to_owned()
-    } else {
-        items.join("\n---\n")
-    }
-}
-
-fn truncate_for_contract_context(text: &str, max_chars: usize) -> String {
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_owned();
-    }
-
-    let mut truncated: String = trimmed.chars().take(max_chars).collect();
-    truncated.push_str("\n... [truncated]");
-    truncated
-}
-
-fn extract_current_task(content: &str) -> String {
-    let start = "<<<USER_MESSAGE>>>";
-    let end = "<<<END_USER_MESSAGE>>>";
-    let Some(start_idx) = content.find(start) else {
-        return content.trim().to_owned();
-    };
-    let after_start = start_idx + start.len();
-    let Some(end_idx) = content[after_start..].find(end) else {
-        return content[after_start..].trim().to_owned();
-    };
-    content[after_start..after_start + end_idx]
-        .trim()
-        .to_owned()
-}
-
-fn normalize_path_hint(path: &str) -> String {
-    path.trim().replace('\\', "/")
-}
-
-fn normalize_text_hint(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-fn string_arg<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    arguments.get(key).and_then(Value::as_str).map(str::trim)
-}
-
-fn write_path_from_execution(result: &ToolExecution) -> Option<String> {
-    for key in ["path", "filename"] {
-        if let Some(value) = string_arg(&result.arguments, key) {
-            if !value.is_empty() {
-                return Some(value.to_owned());
-            }
-        }
-    }
-
-    serde_json::from_str::<Value>(&result.result)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("path")
-                .and_then(Value::as_str)
-                .or_else(|| value.get("filename").and_then(Value::as_str))
-                .map(str::to_owned)
-        })
 }
 
 // ---------------------------------------------------------------------------
@@ -812,7 +434,6 @@ mod tests {
     struct MockModel {
         responses: AsyncMutex<VecDeque<CompletionResult>>,
         requests: Arc<AsyncMutex<Vec<Vec<ChatMessage>>>>,
-        contract_response: Option<String>,
     }
 
     impl MockModel {
@@ -820,15 +441,6 @@ mod tests {
             Self {
                 responses: AsyncMutex::new(responses.into_iter().collect()),
                 requests: Arc::new(AsyncMutex::new(Vec::new())),
-                contract_response: None,
-            }
-        }
-
-        fn with_contract(responses: Vec<CompletionResult>, contract_response: &str) -> Self {
-            Self {
-                responses: AsyncMutex::new(responses.into_iter().collect()),
-                requests: Arc::new(AsyncMutex::new(Vec::new())),
-                contract_response: Some(contract_response.to_owned()),
             }
         }
     }
@@ -844,12 +456,6 @@ mod tests {
             _think_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
             _answer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         ) -> Result<CompletionResult> {
-            if is_contract_request(messages) {
-                return Ok(text_response(self.contract_response.as_deref().unwrap_or(
-                    r#"{"goal":"test task","allowed_to_answer_without_tools":true,"final_conditions":[],"failure_policy":"none"}"#,
-                )));
-            }
-
             self.requests.lock().await.push(messages.to_vec());
             self.responses
                 .lock()
@@ -859,33 +465,38 @@ mod tests {
         }
     }
 
-    fn is_contract_request(messages: &[ChatMessage]) -> bool {
-        messages.iter().any(|message| {
-            message.role == "system"
-                && message
-                    .content
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("Task contract classifier")
-        })
-    }
-
     // ------------------------------------------------------------------
     // Mock tools
     // ------------------------------------------------------------------
 
+    #[derive(Clone)]
+    enum MockToolOutput {
+        Ok(String),
+        Err(String),
+    }
+
     struct MockTools {
         names: Vec<String>,
-        outputs: HashMap<String, Result<String>>,
+        outputs: Arc<Mutex<HashMap<String, VecDeque<MockToolOutput>>>>,
         calls: Arc<Mutex<Vec<(String, Map<String, Value>)>>>,
     }
 
     impl MockTools {
         fn with_outputs(outputs: HashMap<String, Result<String>>) -> Self {
             let names = outputs.keys().cloned().collect();
+            let outputs = outputs
+                .into_iter()
+                .map(|(name, result)| {
+                    let output = match result {
+                        Ok(value) => MockToolOutput::Ok(value),
+                        Err(error) => MockToolOutput::Err(error.to_string()),
+                    };
+                    (name, std::iter::once(output).collect())
+                })
+                .collect();
             Self {
                 names,
-                outputs,
+                outputs: Arc::new(Mutex::new(outputs)),
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -903,10 +514,20 @@ mod tests {
                 .expect("mock tool calls lock poisoned")
                 .push((name.to_owned(), arguments));
 
-            match self.outputs.get(name) {
-                Some(Ok(result)) => Ok(result.clone()),
-                Some(Err(error)) => Err(anyhow!(error.to_string())),
-                None => Err(anyhow!("missing mock tool output")),
+            let mut outputs = self
+                .outputs
+                .lock()
+                .expect("mock tool outputs lock poisoned");
+            let Some(queue) = outputs.get_mut(name) else {
+                return Err(anyhow!("missing mock tool output"));
+            };
+            let Some(next) = queue.pop_front() else {
+                return Err(anyhow!("missing mock tool output"));
+            };
+
+            match next {
+                MockToolOutput::Ok(result) => Ok(result),
+                MockToolOutput::Err(error) => Err(anyhow!(error)),
             }
         }
     }
@@ -1157,283 +778,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_code_explanation_after_search_without_source_read() {
-        let model = MockModel::with_contract(
-            vec![
-                tool_call_response(
-                    "call_1",
-                    "search_code_tool",
-                    json!({"path": "src/acp.rs", "query": "struct"}),
-                ),
-                text_response(
-                    "`src/acp.rs` is the core ACP server module. It manages sessions and handles JSON-RPC workflow.",
-                ),
-                tool_call_response(
-                    "call_2",
-                    "read_file_tool",
-                    json!({"path": "src/acp.rs", "start_line": 135, "limit": 80}),
-                ),
-                text_response(
-                    "After reading source, `AcpServer` stores sessions and the model client.",
-                ),
-            ],
-            r#"{"goal":"Explain src/acp.rs","allowed_to_answer_without_tools":false,"final_conditions":[{"type":"source_read","path_hint":"acp.rs","reason":"The user asked about local source file behavior"}],"failure_policy":"Say what source could not be read."}"#,
-        );
-        let tools = MockTools::with_outputs(HashMap::from([
-            (
-                "search_code_tool".to_owned(),
-                Ok("135:pub struct AcpServer {".to_owned()),
-            ),
-            (
-                "read_file_tool".to_owned(),
-                Ok("135:pub struct AcpServer {\n136:    sessions: ...".to_owned()),
-            ),
-        ]));
-
-        let result = run_agent_loop(
-            &model,
-            &[ConversationMessage::new("user", "Explain src/acp.rs.")],
-            &tools,
-            &[],
-            None,
-            AgentLoopOptions::default(),
-        )
-        .await
-        .expect("loop should recover by reading source");
-
-        assert_eq!(
-            result.answer,
-            "After reading source, `AcpServer` stores sessions and the model client."
-        );
-        assert_eq!(result.tool_results.len(), 2);
-        assert_eq!(result.tool_results[0].name, "search_code_tool");
-        assert_eq!(result.tool_results[1].name, "read_file_tool");
-
-        let requests = model.requests.lock().await;
-        let correction_request = requests
-            .iter()
-            .find(|request| {
-                request.iter().any(|message| {
-                    message.role == "user"
-                        && message
-                            .content
-                            .as_deref()
-                            .unwrap_or_default()
-                            .contains("unmet final-answer conditions")
-                })
-            })
-            .expect("guard should add a correction message");
-        assert!(!correction_request.iter().any(|message| {
-            message
-                .content
-                .as_deref()
-                .unwrap_or_default()
-                .contains("core ACP server module")
-        }));
-    }
-
-    #[tokio::test]
-    async fn allows_code_explanation_after_source_read() {
-        let model = MockModel::new(vec![
-            tool_call_response(
-                "call_1",
-                "read_file_tool",
-                json!({"path": "src/acp.rs", "start_line": 135, "limit": 80}),
-            ),
-            text_response("`AcpServer` manages sessions based on the source read."),
-        ]);
-        let tools = MockTools::with_outputs(HashMap::from([(
-            "read_file_tool".to_owned(),
-            Ok("135:pub struct AcpServer {\n136:    sessions: ...".to_owned()),
-        )]));
-
-        let result = run_agent_loop(
-            &model,
-            &[ConversationMessage::new("user", "Explain src/acp.rs.")],
-            &tools,
-            &[],
-            None,
-            AgentLoopOptions::default(),
-        )
-        .await
-        .expect("loop should accept source-grounded answer");
-
-        assert_eq!(
-            result.answer,
-            "`AcpServer` manages sessions based on the source read."
-        );
-        assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.tool_results[0].name, "read_file_tool");
-    }
-
-    #[test]
-    fn parses_turn_contract_and_extracts_wrapped_task() {
-        assert_eq!(
-            latest_user_task(&[ConversationMessage::new(
-                "user",
-                "Task:\n<<<USER_MESSAGE>>>\nexplain acp.rs how it works\n<<<END_USER_MESSAGE>>>\n\nReminder:\n- Use tools",
-            )]),
-            "explain acp.rs how it works"
-        );
-
-        let contract = parse_turn_contract(
-            r#"{"goal":"Explain acp.rs","allowed_to_answer_without_tools":false,"final_conditions":[{"type":"source_read","path_hint":"acp.rs","reason":"source file explanation"}],"failure_policy":"Report missing source."}"#,
-        )
-        .expect("valid contract");
-
-        assert_eq!(contract.goal, "Explain acp.rs");
-        assert!(!contract.allowed_to_answer_without_tools);
-        assert_eq!(
-            contract.final_conditions,
-            vec![FinalCondition::SourceRead {
-                path_hint: Some("acp.rs".to_owned())
-            }]
-        );
-    }
-
-    #[test]
-    fn parses_extended_turn_contract_conditions() {
-        let contract = parse_turn_contract(
-            r#"{"goal":"Implement and verify","allowed_to_answer_without_tools":false,"final_conditions":[{"type":"web_search","query_hint":"agent context window hallucinations","reason":"user asked for web research"},{"type":"write","path_hint":"src/agent_loop.rs","reason":"implementation requested"},{"type":"command","command_hint":"cargo test","reason":"verification requested"}],"failure_policy":"Continue until evidence exists."}"#,
-        )
-        .expect("valid contract");
-
-        assert_eq!(
-            contract.final_conditions,
-            vec![
-                FinalCondition::WebSearch {
-                    query_hint: Some("agent context window hallucinations".to_owned())
-                },
-                FinalCondition::Write {
-                    path_hint: Some("src/agent_loop.rs".to_owned())
-                },
-                FinalCondition::Command {
-                    command_hint: Some("cargo test".to_owned())
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn recent_contract_context_includes_followup_topic() {
-        let context = recent_contract_context(&[
-            ConversationMessage::new(
-                "user",
-                "<<<USER_MESSAGE>>>\nhow can i improve this agent context\n<<<END_USER_MESSAGE>>>",
-            ),
-            ConversationMessage::new(
-                "assistant",
-                "You should inspect session_store.rs before planning.",
-            ),
-            ConversationMessage::new("user", "make a plan to implement the RAG system"),
-        ]);
-
-        assert!(context.contains("how can i improve this agent context"));
-        assert!(context.contains("session_store.rs"));
-        assert!(context.contains("make a plan to implement the RAG system"));
-    }
-
-    #[test]
-    fn evidence_ledger_satisfies_extended_conditions() {
-        let tool_results = vec![
-            ToolExecution {
-                id: "read".to_owned(),
-                name: "read_file_tool".to_owned(),
-                arguments: json!({"path": "src/agent_loop.rs"})
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-                result: "source".to_owned(),
-                error: false,
-            },
-            ToolExecution {
-                id: "web".to_owned(),
-                name: "web_search_tool".to_owned(),
-                arguments: json!({"query": "agent context window hallucinations"})
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-                result: "results".to_owned(),
-                error: false,
-            },
-            ToolExecution {
-                id: "write".to_owned(),
-                name: "patch_file_tool".to_owned(),
-                arguments: json!({"path": "src/agent_loop.rs"})
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-                result: r#"{"status":"patched"}"#.to_owned(),
-                error: false,
-            },
-            ToolExecution {
-                id: "cmd".to_owned(),
-                name: "run_command_tool".to_owned(),
-                arguments: json!({"cmd": "cargo test"}).as_object().cloned().unwrap(),
-                result: "exit_code: 0".to_owned(),
-                error: false,
-            },
-        ];
-        let evidence = EvidenceLedger::from_tool_results(&tool_results);
-
-        assert!(evidence.satisfies(&FinalCondition::SourceRead {
-            path_hint: Some("agent_loop.rs".to_owned())
-        }));
-        assert!(evidence.satisfies(&FinalCondition::WebSearch {
-            query_hint: Some("context window".to_owned())
-        }));
-        assert!(evidence.satisfies(&FinalCondition::Write {
-            path_hint: Some("src/agent_loop.rs".to_owned())
-        }));
-        assert!(evidence.satisfies(&FinalCondition::Command {
-            command_hint: Some("cargo test".to_owned())
-        }));
-    }
-
-    #[tokio::test]
-    async fn blocks_internet_answer_until_web_search_runs() {
-        let model = MockModel::with_contract(
-            vec![
-                text_response("The best practice is to use RAG."),
-                tool_call_response(
-                    "call_1",
-                    "web_search_tool",
-                    json!({"query": "agent context window hallucinations"}),
-                ),
-                text_response(
-                    "After web search, relevant guidance is to retrieve focused context.",
-                ),
-            ],
-            r#"{"goal":"Search web for agent context-window hallucination guidance","allowed_to_answer_without_tools":false,"final_conditions":[{"type":"web_search","query_hint":"context window hallucinations","reason":"The user asked to search the internet"}],"failure_policy":"Ask for a query only if context does not imply one."}"#,
-        );
-        let tools = MockTools::with_outputs(HashMap::from([(
-            "web_search_tool".to_owned(),
-            Ok("Search results".to_owned()),
-        )]));
-
-        let result = run_agent_loop(
-            &model,
-            &[ConversationMessage::new(
-                "user",
-                "search the internet about the one we are discussing",
-            )],
-            &tools,
-            &[],
-            None,
-            AgentLoopOptions::default(),
-        )
-        .await
-        .expect("loop should recover with web search");
-
-        assert_eq!(
-            result.answer,
-            "After web search, relevant guidance is to retrieve focused context."
-        );
-        assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.tool_results[0].name, "web_search_tool");
-    }
-
-    #[tokio::test]
     async fn allows_file_change_claims_after_write_tool_result() {
         let model = MockModel::new(vec![
             tool_call_response(
@@ -1628,8 +972,11 @@ Run `cargo test`.<tool_call|>"#,
     #[test]
     fn system_prompt_has_key_rules() {
         assert!(SYSTEM_PROMPT.contains("You are a coding agent"));
-        assert!(SYSTEM_PROMPT.contains("Use tools for code-grounded claims"));
-        assert!(SYSTEM_PROMPT.contains("Search snippets are not source-read evidence"));
-        assert!(SYSTEM_PROMPT.contains("Keep internal reasoning private"));
+        assert!(SYSTEM_PROMPT.contains("Use tools for source-backed claims"));
+        assert!(SYSTEM_PROMPT.contains("Keep reasoning private"));
+        assert!(SYSTEM_PROMPT.contains("For broad file or module explanations"));
+        assert!(SYSTEM_PROMPT.contains("pipe-separated alternate terms"));
+        assert!(SYSTEM_PROMPT.contains("Use line counts only as a planning aid"));
+        assert!(SYSTEM_PROMPT.contains("Do not write Gemma control tokens"));
     }
 }
