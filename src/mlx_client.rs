@@ -172,10 +172,10 @@ impl MlxClient {
             stream: false,
             messages: messages.to_vec(),
             max_tokens,
-            temperature,
-            top_p: Some(0.95),
+            temperature: model_temperature(temperature, messages),
+            top_p: Some(model_top_p(messages)),
             tools: tools_field,
-            extra_body: Some(gemma4_extra_body(messages)),
+            extra_body: Some(build_model_extra_body(messages)),
         };
 
         let response = self
@@ -221,7 +221,7 @@ impl MlxClient {
         })
     }
 
-    /// Streaming variant: yields Gemma thinking tokens to `think_tx` as they arrive,
+    /// Streaming variant: yields thinking token chunks to `think_tx` as they arrive,
     /// then returns the full CompletionResult (with think tags stripped from content).
     pub async fn complete_streaming(
         &self,
@@ -243,10 +243,10 @@ impl MlxClient {
             stream: true,
             messages: messages.to_vec(),
             max_tokens,
-            temperature,
-            top_p: Some(0.95),
+            temperature: model_temperature(temperature, messages),
+            top_p: Some(model_top_p(messages)),
             tools: tools_field,
-            extra_body: Some(gemma4_extra_body(messages)),
+            extra_body: Some(build_model_extra_body(messages)),
         };
 
         let response = self
@@ -398,11 +398,14 @@ enum StreamEvent {
 /// Feed a delta token into the think state machine.
 /// Splits content into thinking chunks and visible-answer chunks.
 ///
-/// Handles Gemma thinking patterns:
+/// Handles Qwen and Gemma thinking patterns:
+/// - Qwen: `<think>…content…</think>`
 /// - Gemma explicit: `<|think|>…content…<|/think|>`
 /// - Gemma explicit: `<|channel>thought\n…content…<channel|>`
 /// - Gemma pre-filled: `…content…<channel|>`
 fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<StreamEvent> {
+    const OPEN_QWEN_THINK: &str = "<think>";
+    const CLOSE_QWEN_THINK: &str = "</think>";
     const OPEN_GEMMA_THINK: &str = "<|think|>";
     const CLOSE_GEMMA_THINK: &str = "<|/think|>";
     const OPEN_CHANNEL: &str = "<|channel>thought";
@@ -414,8 +417,14 @@ fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<St
     loop {
         match state.thought {
             ThinkState::Before => {
-                let earliest_close = earliest_tag(&state.buf, &[CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
-                let earliest_open = earliest_tag(&state.buf, &[OPEN_GEMMA_THINK, OPEN_CHANNEL]);
+                let earliest_close = earliest_tag(
+                    &state.buf,
+                    &[CLOSE_QWEN_THINK, CLOSE_GEMMA_THINK, CLOSE_CHANNEL],
+                );
+                let earliest_open = earliest_tag(
+                    &state.buf,
+                    &[OPEN_QWEN_THINK, OPEN_GEMMA_THINK, OPEN_CHANNEL],
+                );
 
                 let pre_filled = earliest_close.map_or(false, |(ci, _)| {
                     earliest_open.map_or(true, |(oi, _)| ci <= oi)
@@ -454,7 +463,10 @@ fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<St
                 }
             }
             ThinkState::Inside => {
-                let close = earliest_tag(&state.buf, &[CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
+                let close = earliest_tag(
+                    &state.buf,
+                    &[CLOSE_QWEN_THINK, CLOSE_GEMMA_THINK, CLOSE_CHANNEL],
+                );
                 if let Some((idx, tag)) = close {
                     let before_close = state.buf[..idx].to_owned();
                     if !before_close.is_empty() {
@@ -576,15 +588,40 @@ struct CompletionRequest {
     extra_body: Option<Value>,
 }
 
-fn gemma4_extra_body(messages: &[ChatMessage]) -> Value {
+fn build_model_extra_body(messages: &[ChatMessage]) -> Value {
     let enable_thinking = !messages.iter().any(is_fast_mode_message);
     serde_json::json!({
-        "top_k": 64,
+        "top_k": 20,
         "enable_thinking": enable_thinking,
         "chat_template_kwargs": {
             "enable_thinking": enable_thinking
         }
     })
+}
+
+/// Returns `top_p` matching Qwen3 recommended sampling values:
+/// - thinking mode: 0.95
+/// - non-thinking (fast) mode: 0.8
+fn model_top_p(messages: &[ChatMessage]) -> f32 {
+    if messages.iter().any(is_fast_mode_message) {
+        0.8
+    } else {
+        0.95
+    }
+}
+
+/// Returns the effective temperature for the current mode.
+///
+/// If the caller passed the thinking-mode default (0.6) but the conversation is
+/// in fast/non-thinking mode, this returns 0.7 (Qwen recommended).
+/// Any other explicitly configured temperature is passed through unchanged.
+fn model_temperature(requested: f32, messages: &[ChatMessage]) -> f32 {
+    let fast = messages.iter().any(is_fast_mode_message);
+    if fast && (requested - 0.6_f32).abs() < f32::EPSILON {
+        0.7
+    } else {
+        requested
+    }
 }
 
 fn is_fast_mode_message(message: &ChatMessage) -> bool {
@@ -713,6 +750,35 @@ mod tests {
 
         assert_eq!(thought, "I will inspect.");
         assert_eq!(answer, "The answer.");
+    }
+
+    #[test]
+    fn stream_content_chunk_handles_qwen_think_tag_pair() {
+        let mut state = ContentStreamState::default();
+        let mut thought = String::new();
+        let mut answer = String::new();
+
+        for event in stream_content_chunk(&mut state, "<think>qwen reason") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in stream_content_chunk(&mut state, "ing</think>final") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+        for event in finish_content_stream(&mut state) {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+
+        assert_eq!(thought, "qwen reasoning");
+        assert_eq!(answer, "final");
     }
 
     #[test]
@@ -846,23 +912,51 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_extra_body_disables_thinking_for_fast_mode_prompt() {
+    fn build_model_extra_body_disables_thinking_for_fast_mode_prompt() {
         let messages = vec![super::ChatMessage::system(
             "mode_prompt: fast\nCurrent mode: fast.",
         )];
 
-        let body = super::gemma4_extra_body(&messages);
-        assert_eq!(body["top_k"], 64);
+        let body = super::build_model_extra_body(&messages);
+        assert_eq!(body["top_k"], 20);
         assert_eq!(body["enable_thinking"], false);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
     }
 
     #[test]
-    fn gemma4_extra_body_enables_thinking_without_fast_mode_prompt() {
+    fn build_model_extra_body_enables_thinking_without_fast_mode_prompt() {
         let messages = vec![super::ChatMessage::system("Current mode: agent.")];
 
-        let body = super::gemma4_extra_body(&messages);
+        let body = super::build_model_extra_body(&messages);
+        assert_eq!(body["top_k"], 20);
         assert_eq!(body["enable_thinking"], true);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn model_temperature_returns_07_for_fast_mode_when_default_sent() {
+        let fast_messages = vec![super::ChatMessage::system(
+            "mode_prompt: fast\nCurrent mode: fast.",
+        )];
+        let agent_messages = vec![super::ChatMessage::system("Current mode: agent.")];
+
+        // Fast mode with thinking-default temperature → override to 0.7
+        assert!((super::model_temperature(0.6, &fast_messages) - 0.7_f32).abs() < f32::EPSILON);
+        // Agent (thinking) mode → keep 0.6
+        assert!((super::model_temperature(0.6, &agent_messages) - 0.6_f32).abs() < f32::EPSILON);
+        // Explicit non-default temperature → always respected
+        assert!((super::model_temperature(0.3, &fast_messages) - 0.3_f32).abs() < f32::EPSILON);
+        assert!((super::model_temperature(0.9, &agent_messages) - 0.9_f32).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn model_top_p_returns_lower_value_for_fast_mode() {
+        let fast_messages = vec![super::ChatMessage::system(
+            "mode_prompt: fast\nCurrent mode: fast.",
+        )];
+        let agent_messages = vec![super::ChatMessage::system("Current mode: agent.")];
+
+        assert!((super::model_top_p(&fast_messages) - 0.8_f32).abs() < f32::EPSILON);
+        assert!((super::model_top_p(&agent_messages) - 0.95_f32).abs() < f32::EPSILON);
     }
 }

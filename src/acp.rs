@@ -716,7 +716,9 @@ struct AcpThoughtHandler {
 }
 
 fn sanitize_model_meta_for_thought(text: &str) -> String {
-    if !text.contains("<|channel>")
+    if !text.contains("<think>")
+        && !text.contains("</think>")
+        && !text.contains("<|channel>")
         && !text.contains("<channel|>")
         && !text.contains("<|think|>")
         && !text.contains("<|/think|>")

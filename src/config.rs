@@ -1,9 +1,13 @@
 use std::env;
 
 pub const DEFAULT_MLX_URL: &str = "http://127.0.0.1:8000/v1/chat/completions";
-pub const DEFAULT_MODEL_NAME: &str = "mlx-community/gemma-4-e4b-it-OptiQ-4bit";
-// pub const DEFAULT_MODEL_NAME: &str = "mlx-community/gpt-oss-20b-MXFP4-Q4";
-pub const STALE_MODEL_ALIASES: &[&str] = &["mlx", "mlx-community"];
+pub const DEFAULT_MODEL_NAME: &str = "Jackrong/MLX-Qwopus3.5-9B-v3-6bit";
+pub const STALE_MODEL_ALIASES: &[&str] = &[
+    "mlx",
+    "mlx-community",
+    "mlx-community/gemma-4-e4b-it-OptiQ-4bit",
+    "Jackrong/MLX-Qwopus3.5-9B-v3-8bit",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -51,13 +55,25 @@ mod tests {
             resolve_model_name(Some("mlx-community")),
             DEFAULT_MODEL_NAME
         );
+        assert_eq!(
+            resolve_model_name(Some("mlx-community/gemma-4-e4b-it-OptiQ-4bit")),
+            DEFAULT_MODEL_NAME
+        );
     }
 
     #[test]
     fn keeps_explicit_model_name() {
         assert_eq!(
-            resolve_model_name(Some("mlx-community/gemma-4-e4b-it-OptiQ-4bit")),
-            "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
+            resolve_model_name(Some("Jackrong/MLX-Qwopus3.5-9B-v3-6bit")),
+            "Jackrong/MLX-Qwopus3.5-9B-v3-6bit"
+        );
+    }
+
+    #[test]
+    fn stale_8bit_alias_resolves_to_default() {
+        assert_eq!(
+            resolve_model_name(Some("Jackrong/MLX-Qwopus3.5-9B-v3-8bit")),
+            DEFAULT_MODEL_NAME
         );
     }
 }

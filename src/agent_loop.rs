@@ -11,7 +11,7 @@ use crate::mlx_client::{
 use crate::model_parser::extract_thought_blocks;
 
 pub const SYSTEM_PROMPT: &str = "\
-You are a coding agent called Gemma 4.
+You are a coding agent.
 Use tools for source-backed claims.
 Keep reasoning private.
 Think efficiently and briefly.
@@ -25,7 +25,7 @@ When files are independent, read in parallel.
 For file or module understanding, read before searching.
 For narrow lookups, search first with `|`-separated alternates, then read the relevant lines.
 Use line counts only to size reads.
-Do not emit Gemma control tokens, ACP thinking tags, or tool-call syntax in user-visible answers.
+Do not emit thinking tags, control tokens, or tool-call syntax in user-visible answers.
 If unsure, say so.
 ";
 // ---------------------------------------------------------------------------
@@ -138,6 +138,9 @@ pub struct AgentLoopOptions {
     /// Maximum number of tool calls executed per iteration. The model may
     /// request more; excess calls are silently dropped and picked up next turn.
     pub max_parallel_tool_calls: usize,
+    /// Maximum characters kept per tool result before it is truncated.
+    /// Prevents large file reads from filling GPU memory on the next inference.
+    pub max_tool_result_chars: usize,
 }
 
 impl Default for AgentLoopOptions {
@@ -145,8 +148,9 @@ impl Default for AgentLoopOptions {
         Self {
             max_iterations: 16,
             max_tokens: 3200,
-            temperature: 1.0,
+            temperature: 0.6, // Qwen recommended for thinking mode
             max_parallel_tool_calls: 8,
+            max_tool_result_chars: 12_000,
         }
     }
 }
@@ -399,8 +403,10 @@ pub async fn run_agent_loop(
         }
 
         // Push tool result messages with matching tool_call_id.
+        // Truncate large results to avoid GPU OOM on the next inference.
         for exec in &executions {
-            conversation.push(ChatMessage::tool_result(&exec.id, exec.result.clone()));
+            let result = truncate_tool_result(&exec.result, options.max_tool_result_chars);
+            conversation.push(ChatMessage::tool_result(&exec.id, result));
         }
 
         if let Some(summary) =
@@ -644,6 +650,19 @@ fn is_context_gathering_tool(name: &str) -> bool {
             | "web_fetch_tool"
             | "web_search_tool"
     )
+}
+
+fn truncate_tool_result(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    // Snap to a UTF-8 char boundary so we don't slice mid-codepoint.
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let omitted = text.len() - end;
+    format!("{}\n... [truncated {omitted} chars]", &text[..end])
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,6 +1305,30 @@ Run `cargo test`.<tool_call|>"#,
     }
 
     #[test]
+    fn truncate_tool_result_under_limit() {
+        assert_eq!(truncate_tool_result("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_tool_result_over_limit() {
+        let long = "a".repeat(20_000);
+        let result = truncate_tool_result(&long, 12_000);
+        assert!(result.starts_with(&"a".repeat(12_000)));
+        assert!(result.contains("[truncated 8000 chars]"));
+    }
+
+    #[test]
+    fn truncate_tool_result_utf8_boundary() {
+        // 3-byte UTF-8 codepoint — slicing mid-codepoint must not panic.
+        let s = "€".repeat(10_000); // each '€' is 3 bytes = 30_000 bytes total
+        let result = truncate_tool_result(&s, 10_001); // limit falls mid-codepoint
+        // Must not panic, must be valid UTF-8, must be shorter than the original.
+        assert!(result.len() < s.len());
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert!(result.contains("[truncated"));
+    }
+
+    #[test]
     fn system_prompt_has_key_rules() {
         assert!(SYSTEM_PROMPT.contains("You are a coding agent"));
         assert!(SYSTEM_PROMPT.contains("Use tools for source-backed claims"));
@@ -1302,6 +1345,7 @@ Run `cargo test`.<tool_call|>"#,
         assert!(SYSTEM_PROMPT.contains("For file or module understanding"));
         assert!(SYSTEM_PROMPT.contains("search first with `|`-separated alternates"));
         assert!(SYSTEM_PROMPT.contains("Use line counts only to size reads"));
-        assert!(SYSTEM_PROMPT.contains("Do not emit Gemma control tokens"));
+        assert!(SYSTEM_PROMPT.contains("Do not emit thinking tags"));
+        assert!(!SYSTEM_PROMPT.contains("Gemma"));
     }
 }

@@ -13,6 +13,7 @@ pub fn extract_thought_blocks(raw_text: &str) -> (Vec<String>, String) {
             1usize,
         ),
         (Regex::new(r"(?s)<\|think\|>(.*?)<\|/think\|>").unwrap(), 1),
+        (Regex::new(r"(?s)<think>(.*?)</think>").unwrap(), 1),
     ];
 
     let mut working = raw_text.to_owned();
@@ -32,6 +33,7 @@ pub fn extract_thought_blocks(raw_text: &str) -> (Vec<String>, String) {
     let prefilled_close_patterns = [
         (Regex::new(r"(?s)^(.*?)<\|/think\|>(.*)$").unwrap(), 1usize),
         (Regex::new(r"(?s)^(.*?)<channel\|>(.*)$").unwrap(), 1usize),
+        (Regex::new(r"(?s)^(.*?)</think>(.*)$").unwrap(), 1usize),
     ];
 
     for (re, group) in prefilled_close_patterns {
@@ -56,6 +58,7 @@ pub fn extract_thought_blocks(raw_text: &str) -> (Vec<String>, String) {
     let orphan_open_patterns = [
         Regex::new(r"(?s)<\|channel>thought(?:[ \t]*\r?\n|[ \t]+)?(.*)$").unwrap(),
         Regex::new(r"(?s)<\|think\|>(.*)$").unwrap(),
+        Regex::new(r"(?s)<think>(.*)$").unwrap(),
     ];
 
     for re in orphan_open_patterns {
@@ -81,14 +84,18 @@ pub fn extract_thought_blocks(raw_text: &str) -> (Vec<String>, String) {
 }
 
 fn strip_residual_meta(text: &str) -> String {
-    let drop_meta_lines =
-        Regex::new(r"(?m)^\s*(?:<\|channel>|<channel\|>|<\|think\|>|<\|/think\|>).*$").unwrap();
+    let drop_meta_lines = Regex::new(
+        r"(?m)^\s*(?:<\|channel>|<channel\|>|<\|think\|>|<\|/think\|>|<think>|</think>).*$",
+    )
+    .unwrap();
     let stripped_lines = drop_meta_lines.replace_all(text, "");
     stripped_lines
         .replace("<|channel>", "")
         .replace("<channel|>", "")
         .replace("<|think|>", "")
         .replace("<|/think|>", "")
+        .replace("<think>", "")
+        .replace("</think>", "")
 }
 
 #[cfg(test)]
@@ -140,6 +147,41 @@ mod tests {
         let (thoughts, text) = extract_thought_blocks(raw);
         assert!(thoughts.is_empty());
         assert_eq!(text, "Hello, world!");
+    }
+
+    #[test]
+    fn strips_qwen_think_tag_pair() {
+        let raw = "<think>some qwen reasoning</think>final answer";
+        let (thoughts, text) = extract_thought_blocks(raw);
+        assert_eq!(thoughts, vec!["some qwen reasoning"]);
+        assert_eq!(text, "final answer");
+    }
+
+    #[test]
+    fn strips_qwen_think_multiline() {
+        let raw = "<think>\nI will read the file.\nThen answer.\n</think>\nHere is the result.";
+        let (thoughts, text) = extract_thought_blocks(raw);
+        assert_eq!(thoughts, vec!["I will read the file.\nThen answer."]);
+        assert_eq!(text, "Here is the result.");
+    }
+
+    #[test]
+    fn strips_qwen_prefilled_close_form() {
+        let raw = "I am already thinking.</think>Here is the result.";
+        let (thoughts, text) = extract_thought_blocks(raw);
+        assert_eq!(thoughts, vec!["I am already thinking."]);
+        assert_eq!(text, "Here is the result.");
+    }
+
+    #[test]
+    fn strips_qwen_orphan_open_tag() {
+        let raw = "<think>I should call a tool but never close the tag.";
+        let (thoughts, text) = extract_thought_blocks(raw);
+        assert_eq!(
+            thoughts,
+            vec!["I should call a tool but never close the tag."]
+        );
+        assert_eq!(text, "");
     }
 
     #[test]
