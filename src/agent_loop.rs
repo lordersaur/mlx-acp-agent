@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -12,10 +14,18 @@ pub const SYSTEM_PROMPT: &str = "\
 You are a coding agent called Gemma 4.
 Use tools for source-backed claims.
 Keep reasoning private.
-For broad file or module explanations, read the file or read sequential chunks before searching.
-For narrow symbol or exact-text lookups, search first with pipe-separated alternate terms, then read the relevant lines.
-Use line counts only as a planning aid when choosing read size.
-Do not write Gemma control tokens, ACP thinking tags, or tool-call displays in user-visible answers.
+Think efficiently and briefly.
+Plan complex tasks internally before acting or answering.
+Honor explicit constraints, delimiters, and examples.
+For broad audits, use `list_dir_tool` with metadata to discover files, then `read_file_tool` for the relevant content. Continue truncated file reads until complete, and answer only after you have enough coverage. When you need full-file coverage, prefer parallel tool calls for independent files and use larger read limits instead of many tiny reads.
+Treat returned source content as the material to analyze immediately; do not wait for more unless the tool explicitly says it is incomplete.
+When coverage is complete, stop gathering and write the requested analysis or refactor plan immediately.
+Do not restate the audit plan after coverage is complete.
+When files are independent, read in parallel.
+For file or module understanding, read before searching.
+For narrow lookups, search first with `|`-separated alternates, then read the relevant lines.
+Use line counts only to size reads.
+Do not emit Gemma control tokens, ACP thinking tags, or tool-call syntax in user-visible answers.
 If unsure, say so.
 ";
 // ---------------------------------------------------------------------------
@@ -60,6 +70,66 @@ pub struct LoopResult {
     pub answer_streamed: bool,
 }
 
+#[derive(Debug, Default)]
+struct CoverageTracker {
+    discovered_files: BTreeSet<String>,
+    covered_files: BTreeSet<String>,
+}
+
+impl CoverageTracker {
+    fn observe(&mut self, tool: &ToolExecution) {
+        match tool.name.as_str() {
+            "list_dir_tool" => self.observe_list_dir(&tool.arguments, &tool.result),
+            "read_file_tool" => self.observe_read_file(&tool.arguments, &tool.result),
+            _ => {}
+        }
+    }
+
+    fn observe_list_dir(&mut self, arguments: &Map<String, Value>, result: &str) {
+        let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+            return;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(result) else {
+            return;
+        };
+        let Some(entries) = parsed.get("entries").and_then(Value::as_array) else {
+            return;
+        };
+        for entry in entries {
+            let Some(kind) = entry.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            if kind != "file" {
+                continue;
+            }
+            let Some(name) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            self.discovered_files
+                .insert(normalize_relative_path(&resolve_child_path(path, name)));
+        }
+    }
+
+    fn observe_read_file(&mut self, arguments: &Map<String, Value>, result: &str) {
+        let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+            return;
+        };
+        if !is_complete_file_chunk(result) {
+            return;
+        }
+        self.covered_files.insert(normalize_relative_path(path));
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.discovered_files.is_empty()
+            && self
+                .discovered_files
+                .iter()
+                .all(|path| self.covered_files.contains(path))
+    }
+
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AgentLoopOptions {
     pub max_iterations: usize,
@@ -73,10 +143,10 @@ pub struct AgentLoopOptions {
 impl Default for AgentLoopOptions {
     fn default() -> Self {
         Self {
-            max_iterations: 25,
-            max_tokens: 2500,
+            max_iterations: 16,
+            max_tokens: 3200,
             temperature: 1.0,
-            max_parallel_tool_calls: 6,
+            max_parallel_tool_calls: 8,
         }
     }
 }
@@ -168,6 +238,7 @@ pub async fn run_agent_loop(
 ) -> Result<LoopResult> {
     let mut all_tool_results: Vec<ToolExecution> = Vec::new();
     let mut answer_streamed = false;
+    let mut coverage = CoverageTracker::default();
 
     // Build the initial conversation as proper ChatMessages.
     let mut conversation: Vec<ChatMessage> = Vec::new();
@@ -183,6 +254,8 @@ pub async fn run_agent_loop(
     debug_assert!(conversation.iter().skip(1).all(|m| m.role != "system"));
 
     for iteration in 0..options.max_iterations {
+        let mut iteration_reasoning = String::new();
+
         // When a thought handler is present, enable streaming so think tokens
         // arrive in real time (writing animation in the Zed panel).
         let (think_tx, mut think_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -205,6 +278,9 @@ pub async fn run_agent_loop(
                 tokio::select! {
                     res = &mut complete_fut => break res?,
                     Some(chunk) = think_rx.recv() => {
+                        if !chunk.is_empty() {
+                            append_reasoning_chunk(&mut iteration_reasoning, &chunk);
+                        }
                         if let Some(ref mut handler) = on_thought {
                             handler.on_thought_chunk(&chunk).await;
                         }
@@ -254,6 +330,10 @@ pub async fn run_agent_loop(
             }
         }
 
+        if !thoughts.is_empty() {
+            append_reasoning_chunk(&mut iteration_reasoning, &thoughts.join("\n\n"));
+        }
+
         if result.tool_calls.is_empty() {
             let answer = clean_text
                 .filter(|t| !t.trim().is_empty())
@@ -278,6 +358,7 @@ pub async fn run_agent_loop(
         if let Some(handler) = on_thought.as_deref_mut() {
             if let Some(ref text) = clean_text {
                 if !text.trim().is_empty() {
+                    append_reasoning_chunk(&mut iteration_reasoning, text);
                     handler.on_thought(text).await;
                 }
             }
@@ -313,10 +394,19 @@ pub async fn run_agent_loop(
         // same failing call indefinitely.
         let executions = execute_tools(&tool_calls, tools, &all_tool_results).await;
         all_tool_results.extend(executions.iter().cloned());
+        for exec in &executions {
+            coverage.observe(exec);
+        }
 
         // Push tool result messages with matching tool_call_id.
         for exec in &executions {
             conversation.push(ChatMessage::tool_result(&exec.id, exec.result.clone()));
+        }
+
+        if let Some(summary) =
+            summarize_reasoning_for_context(&iteration_reasoning, coverage.is_complete())
+        {
+            conversation.push(ChatMessage::assistant(summary));
         }
     }
 
@@ -373,8 +463,27 @@ async fn execute_one(
             id: tool_call.id.clone(),
             name: tool_call.name.clone(),
             arguments: tool_call.arguments.clone(),
-            result: "Skipped repeated failed tool call with the same arguments. Re-read the relevant file/output and choose a different, smaller patch or another tool instead of retrying this call.".to_owned(),
+            result: "Repeated failed tool call with the same arguments. Reuse the earlier failure signal, then choose a different tool or a smaller change instead of retrying this call.".to_owned(),
             error: true,
+        };
+    }
+
+    if is_context_gathering_tool(&tool_call.name)
+        && repeated_successful_call_count(tool_call, previous_results) >= 1
+    {
+        let replay = previous_results.iter().rev().find(|result| {
+            !result.error && result.name == tool_call.name && result.arguments == tool_call.arguments
+        });
+        return ToolExecution {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+            result: replay
+                .map(|result| result.result.clone())
+                .unwrap_or_else(|| {
+                    "Reused earlier result for this exact context-gathering tool call. Continue from that result instead of re-reading the same content.".to_owned()
+                }),
+            error: false,
         };
     }
 
@@ -399,6 +508,108 @@ async fn execute_one(
     }
 }
 
+fn append_reasoning_chunk(buf: &mut String, chunk: &str) {
+    let normalized = chunk
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return;
+    }
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(&normalized);
+}
+
+fn summarize_reasoning_for_context(reasoning: &str, coverage_complete: bool) -> Option<String> {
+    let compact = reasoning
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned();
+    if compact.is_empty() {
+        return None;
+    }
+
+    let mut summary = to_past_tense_summary(&compact);
+    if coverage_complete {
+        summary.push_str(" Coverage had been completed.");
+    }
+
+    const MAX_SUMMARY_CHARS: usize = 360;
+    if summary.len() <= MAX_SUMMARY_CHARS {
+        return Some(summary);
+    }
+
+    let mut end = MAX_SUMMARY_CHARS;
+    while end > 0 && !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{} ...", &summary[..end]))
+}
+
+fn to_past_tense_summary(text: &str) -> String {
+    let trimmed = text.trim().trim_end_matches('.');
+    let lower_first = |value: &str| {
+        let mut chars = value.chars();
+        match chars.next() {
+            Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        }
+    };
+
+    let past = if let Some(rest) = trimmed.strip_prefix("I should ") {
+        format!("I had decided to {}", lower_first(rest))
+    } else if let Some(rest) = trimmed.strip_prefix("I will ") {
+        format!("I had planned to {}", lower_first(rest))
+    } else if let Some(rest) = trimmed.strip_prefix("I need to ") {
+        format!("I had needed to {}", lower_first(rest))
+    } else if let Some(rest) = trimmed.strip_prefix("I want to ") {
+        format!("I had wanted to {}", lower_first(rest))
+    } else if let Some(rest) = trimmed.strip_prefix("I must ") {
+        format!("I had to {}", lower_first(rest))
+    } else if let Some(rest) = trimmed.strip_prefix("Let's ") {
+        format!("I had decided to {}", lower_first(rest))
+    } else if let Some(rest) = trimmed.strip_prefix("We should ") {
+        format!("I had decided that we should {}", lower_first(rest))
+    } else if let Some(rest) = trimmed.strip_prefix("I am ") {
+        format!("I had been {}", lower_first(rest))
+    } else if let Some(rest) = trimmed.strip_prefix("I was ") {
+        format!("I had been {}", lower_first(rest))
+    } else {
+        format!("I had already {}", lower_first(trimmed))
+    };
+
+    if past.ends_with('.') {
+        past
+    } else {
+        format!("{past}.")
+    }
+}
+
+fn resolve_child_path(parent: &str, child: &str) -> String {
+    std::path::Path::new(parent)
+        .join(child)
+        .display()
+        .to_string()
+}
+
+fn normalize_relative_path(path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    normalized.trim_matches('/').to_owned()
+}
+
+fn is_complete_file_chunk(result: &str) -> bool {
+    !result.contains("[Continue at line ")
+        && !result.contains("[start_line ")
+        && !result.contains("truncated")
+}
+
 fn repeated_failed_call_count(
     tool_call: &ApiToolCall,
     previous_results: &[ToolExecution],
@@ -409,6 +620,30 @@ fn repeated_failed_call_count(
             result.error && result.name == tool_call.name && result.arguments == tool_call.arguments
         })
         .count()
+}
+
+fn repeated_successful_call_count(
+    tool_call: &ApiToolCall,
+    previous_results: &[ToolExecution],
+) -> usize {
+    previous_results
+        .iter()
+        .filter(|result| {
+            !result.error && result.name == tool_call.name && result.arguments == tool_call.arguments
+        })
+        .count()
+}
+
+fn is_context_gathering_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file_tool"
+            | "list_dir_tool"
+            | "search_code_tool"
+            | "find_file_tool"
+            | "web_fetch_tool"
+            | "web_search_tool"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -693,9 +928,90 @@ mod tests {
         assert_eq!(result.tool_results.len(), 3);
         assert_eq!(
             result.tool_results[2].result,
-            "Skipped repeated failed tool call with the same arguments. Re-read the relevant file/output and choose a different, smaller patch or another tool instead of retrying this call."
+            "Repeated failed tool call with the same arguments. Reuse the earlier failure signal, then choose a different tool or a smaller change instead of retrying this call."
         );
         assert_eq!(tools.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn skips_exact_repeated_context_gathering_call_after_first_success() {
+        let args = json!({"path": "src"});
+        let model = MockModel::new(vec![
+            tool_call_response("call_1", "list_dir_tool", args.clone()),
+            tool_call_response("call_2", "list_dir_tool", args),
+            text_response("I have enough context."),
+        ]);
+        let tools = MockTools::with_outputs(HashMap::from([(
+            "list_dir_tool".to_owned(),
+            Ok("acp.rs\nagent_loop.rs".to_owned()),
+        )]));
+
+        let result = run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Inspect src.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(result.answer, "I have enough context.");
+        assert_eq!(result.tool_results.len(), 2);
+        assert_eq!(
+            result.tool_results[1].result,
+            "acp.rs\nagent_loop.rs"
+        );
+        assert_eq!(tools.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn injects_compact_reasoning_summary_before_next_iteration() {
+        let model = MockModel::new(vec![
+            CompletionResult {
+                content: Some(
+                    "<|channel>thought\nI should inspect the tree before planning.<channel|>"
+                        .to_owned(),
+                ),
+                tool_calls: vec![ApiToolCall {
+                    id: "call_1".to_owned(),
+                    name: "list_dir_tool".to_owned(),
+                    arguments: json!({"path": "src"}).as_object().cloned().unwrap(),
+                }],
+            },
+            text_response("Done."),
+        ]);
+        let tools = MockTools::with_outputs(HashMap::from([(
+            "list_dir_tool".to_owned(),
+            Ok("acp.rs\nagent_loop.rs".to_owned()),
+        )]));
+
+        run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Inspect src.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        let requests = model.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        let second = &requests[1];
+        let summary_msg = second
+            .iter()
+            .find(|msg| msg.role == "assistant" && msg.content.as_deref().unwrap_or_default().contains("I had decided"))
+            .expect("reasoning summary");
+        assert!(
+            summary_msg
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("I had decided to inspect the tree before planning.")
+        );
     }
 
     #[tokio::test]
@@ -974,9 +1290,18 @@ Run `cargo test`.<tool_call|>"#,
         assert!(SYSTEM_PROMPT.contains("You are a coding agent"));
         assert!(SYSTEM_PROMPT.contains("Use tools for source-backed claims"));
         assert!(SYSTEM_PROMPT.contains("Keep reasoning private"));
-        assert!(SYSTEM_PROMPT.contains("For broad file or module explanations"));
-        assert!(SYSTEM_PROMPT.contains("pipe-separated alternate terms"));
-        assert!(SYSTEM_PROMPT.contains("Use line counts only as a planning aid"));
-        assert!(SYSTEM_PROMPT.contains("Do not write Gemma control tokens"));
+        assert!(SYSTEM_PROMPT.contains("Think efficiently and briefly"));
+        assert!(SYSTEM_PROMPT.contains("Plan complex tasks internally"));
+        assert!(SYSTEM_PROMPT.contains("constraints, delimiters, and examples"));
+        assert!(SYSTEM_PROMPT.contains("For broad audits"));
+        assert!(SYSTEM_PROMPT.contains("`list_dir_tool` with metadata to discover files"));
+        assert!(SYSTEM_PROMPT.contains("Continue truncated file reads until complete"));
+        assert!(SYSTEM_PROMPT.contains("When coverage is complete"));
+        assert!(SYSTEM_PROMPT.contains("Do not restate the audit plan after coverage is complete"));
+        assert!(SYSTEM_PROMPT.contains("When files are independent, read in parallel"));
+        assert!(SYSTEM_PROMPT.contains("For file or module understanding"));
+        assert!(SYSTEM_PROMPT.contains("search first with `|`-separated alternates"));
+        assert!(SYSTEM_PROMPT.contains("Use line counts only to size reads"));
+        assert!(SYSTEM_PROMPT.contains("Do not emit Gemma control tokens"));
     }
 }

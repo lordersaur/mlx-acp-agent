@@ -160,9 +160,13 @@ pub fn run_command(
             };
             persist_snapshot(&session, false, Some(exit_code))?;
             sessions.lock().unwrap().remove(&session_id);
-            return Ok(format!(
-                "$ {cmd}\n\nexit_code: {exit_code}\n\noutput (stdout+stderr merged by PTY):\n{output}"
-            ));
+            return Ok(json!({
+                "cmd": cmd,
+                "running": false,
+                "exit_code": exit_code,
+                "output": output,
+            })
+            .to_string());
         }
 
         if std::time::Instant::now() >= deadline {
@@ -171,9 +175,15 @@ pub fn run_command(
                 truncate_output(&buffer.data, MAX_COMMAND_OUTPUT_CHARS)
             };
             persist_snapshot(&session, true, None)?;
-            return Ok(format!(
-                "$ {cmd}\n\nsession_id: {session_id}\n\nrunning: true\n\noutput (stdout+stderr merged by PTY):\n{output}\n\n[command is still running in session `{session_id}`; use read_command_session_tool to follow it or terminate_command_session_tool to stop it]"
-            ));
+            return Ok(json!({
+                "cmd": cmd,
+                "session_id": session_id,
+                "running": true,
+                "exit_code": null,
+                "output": output,
+                "next_step": "Use read_command_session_tool to follow the session or terminate_command_session_tool to stop it."
+            })
+            .to_string());
         }
 
         std::thread::sleep(RUN_COMMAND_POLL_INTERVAL);
@@ -605,7 +615,7 @@ fn list_persisted_sessions() -> Result<Vec<PersistedCmdSession>> {
         return Ok(Vec::new());
     }
 
-    let mut sessions = Vec::new();
+    let mut sessions_by_id: HashMap<String, PersistedCmdSession> = HashMap::new();
     for entry in fs::read_dir(&dir)
         .with_context(|| format!("failed to read sessions dir {}", dir.display()))?
     {
@@ -625,8 +635,9 @@ fn list_persisted_sessions() -> Result<Vec<PersistedCmdSession>> {
             Ok(session) => session,
             Err(_) => continue,
         };
-        sessions.push(session);
+        sessions_by_id.insert(session.session_id.clone(), session);
     }
+    let mut sessions: Vec<PersistedCmdSession> = sessions_by_id.into_values().collect();
     sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     Ok(sessions)
 }
@@ -715,14 +726,15 @@ mod tests {
     }
 
     #[test]
-    fn formats_command_output_like_python() {
+    fn formats_command_output_as_json() {
         let tempdir = TempDir::new().expect("tempdir");
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let output = run_command(&sessions, tempdir.path(), "printf 'hi'").expect("run command");
-        assert_eq!(
-            output,
-            "$ printf 'hi'\n\nexit_code: 0\n\noutput (stdout+stderr merged by PTY):\nhi"
-        );
+        let parsed: Value = serde_json::from_str(&output).expect("json output");
+        assert_eq!(parsed["cmd"], "printf 'hi'");
+        assert_eq!(parsed["running"], false);
+        assert_eq!(parsed["exit_code"], 0);
+        assert_eq!(parsed["output"], "hi");
         assert!(sessions.lock().unwrap().is_empty());
     }
 
@@ -737,8 +749,9 @@ mod tests {
             let output = run_command(&sessions, tempdir.path(), "printf 'ready\\n'; sleep 1")
                 .expect("run command");
 
-            assert!(output.contains("session_id: cmdsess_"));
-            assert!(output.contains("running: true"));
+            let parsed: Value = serde_json::from_str(&output).expect("json output");
+            assert!(parsed["session_id"].as_str().unwrap().starts_with("cmdsess_"));
+            assert_eq!(parsed["running"], true);
 
             let listed = list_command_sessions(&sessions).expect("list");
             let items = listed.as_array().expect("array");
@@ -768,10 +781,13 @@ mod tests {
             let empty_sessions = Arc::new(Mutex::new(HashMap::new()));
             let listed = list_command_sessions(&empty_sessions).expect("list");
             let items = listed.as_array().expect("array");
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0]["session_id"], Value::String(session_id));
-            assert_eq!(items[0]["running"], Value::Bool(false));
-            assert!(items[0]["last_output"].as_str().unwrap().contains("ready"));
+            let matching: Vec<_> = items
+                .iter()
+                .filter(|item| item["session_id"] == Value::String(session_id.clone()))
+                .collect();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0]["running"], Value::Bool(false));
+            assert!(matching[0]["last_output"].as_str().unwrap().contains("ready"));
         });
     }
 

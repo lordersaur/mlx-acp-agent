@@ -13,8 +13,10 @@ Rust ACP coding agent for Zed.
   - repeat until final answer
 - The loop is in-memory only right now.
 - Session reload persistence was removed on purpose.
-- Tool descriptions are intentionally short and direct.
+- Tool descriptions are intentionally short and direct, but discovery tools may now include small metadata when that helps the model plan.
 - `AGENTS.md` is the repo guidance file now. `CLAUDE.md` was removed.
+- Broad audit workflows now rely on `list_dir_tool` plus `read_file_tool` rather than a source-tree dump tool.
+- The loop tracks coverage locally and may inject a short past-tense summary of the previous reasoning/action between iterations.
 
 ## Important Files
 
@@ -29,10 +31,14 @@ Rust ACP coding agent for Zed.
 ## Working Rules
 
 - Prefer the public agent-loop pattern over custom contract or evidence phases.
-- Keep prompts and tool descriptions minimal.
+- Keep prompts and tool descriptions minimal, but make discovery/read handoffs explicit.
 - Do not reintroduce disk-backed session persistence unless explicitly asked.
 - Avoid hardcoded prompt fixes for single runs or single failures.
 - For code questions, search for exact symbols and follow the call chain from source.
+- For broad audits, use `list_dir_tool` with metadata to discover files, then `read_file_tool` for the relevant content.
+- For direct single-file requests, read the named file directly unless the path is ambiguous or missing.
+- Coverage completion is tracked in the loop; it should not be treated as a separate user-facing phase.
+- If you need to summarize prior reasoning between iterations, keep it short and past tense.
 
 ## Runtime Notes
 

@@ -28,13 +28,12 @@ use crate::tools::{BuiltinToolRegistry, ToolProgressEvent, ToolProgressSink};
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_HISTORY_TURNS: usize = 10;
-const MAX_TURN_CHARS: usize = 5000;
+const MAX_HISTORY_TURNS: usize = 6;
+const MAX_TURN_CHARS: usize = 3500;
 const PROTOCOL_VERSION: u64 = 1;
 
 const TOOL_KINDS: &[(&str, &str)] = &[
     ("read_file_tool", "read"),
-    ("read_source_tree_tool", "read"),
     ("list_dir_tool", "read"),
     ("search_code_tool", "search"),
     ("find_file_tool", "search"),
@@ -426,11 +425,11 @@ impl AcpServer {
         info!("session/set_mode session_id={session_id} mode={mode_id}");
         let valid_modes = ["ask", "edit", "agent", "fast"];
         if valid_modes.contains(&mode_id.as_str()) {
-                let mut map = self.sessions.lock().unwrap();
-                if let Some(entry) = map.get_mut(&session_id) {
-                    entry.state.mode_id = mode_id;
-                }
+            let mut map = self.sessions.lock().unwrap();
+            if let Some(entry) = map.get_mut(&session_id) {
+                entry.state.mode_id = mode_id;
             }
+        }
         Ok(json!({}))
     }
 
@@ -482,12 +481,7 @@ impl AcpServer {
         };
 
         // Build conversation messages
-        let messages = build_messages(
-            &mode_id,
-            &cwd,
-            &turns,
-            &user_text,
-        );
+        let messages = build_messages(&mode_id, &cwd, &turns, &user_text);
 
         let tool_schemas = registry.tool_schemas();
 
@@ -826,8 +820,7 @@ struct AcpProgressSink {
     session_id: String,
 }
 
-impl AcpProgressSink {
-}
+impl AcpProgressSink {}
 
 impl ToolProgressSink for AcpProgressSink {
     fn emit(&self, event: ToolProgressEvent) {
@@ -1541,7 +1534,10 @@ fn build_messages(
         ));
     }
 
-    messages.push(ConversationMessage::new("user", build_current_user_prompt(user_text)));
+    messages.push(ConversationMessage::new(
+        "user",
+        build_current_user_prompt(user_text),
+    ));
     messages
 }
 
@@ -1555,7 +1551,9 @@ Task:
 
 Reminder:
 - Use tools only when needed.
-- Follow the requested output format."
+- Follow the requested output format.
+- Honor explicit constraints and delimiters from the user message exactly.
+- If the user gives examples, match their structure unless they conflict with a stronger instruction."
     )
 }
 
@@ -1596,7 +1594,6 @@ fn render_tool_title(name: &str, args: &Map<String, Value>) -> String {
 
     match name {
         "read_file_tool" => render_read_title(args),
-        "read_source_tree_tool" => format!("Read source tree {}", display_value(&path, ".")),
         "list_dir_tool" => format!("List {}", display_value(&path, ".")),
         "search_code_tool" => {
             if path.is_empty() {
@@ -1719,15 +1716,6 @@ fn render_tool_metadata(name: &str, args: &Map<String, Value>) -> String {
             lines.push(format!("Path: {}", display_value(&path, ".")));
             lines.push(format!("Lines: {} - {}", start, start + limit - 1));
         }
-        "read_source_tree_tool" => {
-            lines.push(format!("Path: {}", display_value(&path, ".")));
-            if let Some(max_files) = args.get("max_files").and_then(|v| v.as_u64()) {
-                lines.push(format!("Max files: {max_files}"));
-            }
-            if let Some(limit) = args.get("per_file_line_limit").and_then(|v| v.as_u64()) {
-                lines.push(format!("Per-file line limit: {limit}"));
-            }
-        }
         "search_code_tool" => {
             lines.push(format!("Query: {}", display_value(&query, "<empty>")));
             if !path.is_empty() {
@@ -1773,9 +1761,7 @@ enum ToolVisibleStyle {
 
 fn tool_visible_style(name: &str) -> ToolVisibleStyle {
     match name {
-        "read_file_tool"
-        | "read_source_tree_tool"
-        | "search_code_tool"
+        "read_file_tool" | "search_code_tool"
         | "find_file_tool"
         | "list_dir_tool" => ToolVisibleStyle::Json,
         "patch_file_tool" | "edit_file_tool" | "create_artifact_tool" | "delete_path_tool" => {
@@ -1935,7 +1921,7 @@ mod tests {
     };
     use crate::agent_loop::{ModelClient, ThoughtHandler, ToolExecutor};
     use crate::mlx_client::ChatMessage;
-    use crate::session_store::CommandSessionInfo;
+    // use crate::session_store::CommandSessionInfo;
     use crate::tools::BuiltinToolRegistry;
 
     struct MockModel {
@@ -2162,7 +2148,9 @@ mod tests {
 
         let user = messages.last().expect("current user message");
         assert_eq!(user.role, "user");
-        assert!(user.content.contains("Task:\n<<<USER_MESSAGE>>>\nread CLAUDE.md explain it to me\n<<<END_USER_MESSAGE>>>"));
+        assert!(user.content.contains(
+            "Task:\n<<<USER_MESSAGE>>>\nread CLAUDE.md explain it to me\n<<<END_USER_MESSAGE>>>"
+        ));
         assert!(user.content.contains("Follow the requested output format"));
 
         let system = messages
@@ -2170,7 +2158,11 @@ mod tests {
             .find(|m| m.role == "system")
             .expect("system message");
         assert!(system.content.contains("You are a coding agent"));
-        assert!(system.content.contains("Workspace cwd: /Users/daxel/mlx-acp-agent"));
+        assert!(
+            system
+                .content
+                .contains("Workspace cwd: /Users/daxel/mlx-acp-agent")
+        );
     }
 
     #[test]
@@ -2178,11 +2170,19 @@ mod tests {
         let messages = build_messages(
             "agent",
             "/Users/daxel/mlx-acp-agent",
-            &[crate::session_store::build_turn_record("user", "hello", &[])],
+            &[crate::session_store::build_turn_record(
+                "user",
+                "hello",
+                &[],
+            )],
             "read claude.md",
         );
 
-        assert!(messages.iter().any(|m| m.role == "user" && m.content.contains("hello")));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.contains("hello"))
+        );
     }
 
     #[test]

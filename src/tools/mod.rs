@@ -94,29 +94,13 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "read_file_tool",
-                    "description": "Read workspace file lines for inspection or understanding.",
+                    "description": "Read workspace file lines for inspection, broad understanding, or full-file coverage during audits.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "File path."},
                             "start_line": {"type": "integer", "description": "1-based line number."},
-                            "limit": {"type": "integer", "description": "Maximum lines to return; larger limits can help for broad understanding."}
-                        },
-                        "required": ["path"]
-                    }
-                }
-            }),
-            json!({
-                "type": "function",
-                "function": {
-                    "name": "read_source_tree_tool",
-                    "description": "Read many files under a workspace directory.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Directory path."},
-                            "max_files": {"type": "integer", "description": "Maximum number of files."},
-                            "per_file_line_limit": {"type": "integer", "description": "Maximum lines per file."}
+                            "limit": {"type": "integer", "description": "Maximum lines to return; larger limits can help for broad understanding, full-file audits, or fewer sequential reads."}
                         },
                         "required": ["path"]
                     }
@@ -126,12 +110,14 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "list_dir_tool",
-                    "description": "List workspace files and directories.",
+                    "description": "List workspace file and directory names, with optional metadata for files, to establish exact coverage before reading or planning. Use this for broad directory audits and discovery, not as a content-reading tool.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Directory path."}
-                        }
+                            "path": {"type": "string", "description": "Directory path."},
+                            "include_metadata": {"type": "boolean", "description": "Include metadata such as file kind, size, and line count when available; useful for planning broad audits."}
+                        },
+                        "required": ["path"]
                     }
                 }
             }),
@@ -139,11 +125,11 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "search_code_tool",
-                    "description": "Search file contents with ripgrep; use `|` to join alternate terms.",
+                    "description": "Search file contents with ripgrep for symbols or exact text; use `|` to join alternate terms.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Ripgrep regex. Join alternate terms with `|`."},
+                            "query": {"type": "string", "description": "Ripgrep regex for symbols, anchors, or exact text. Join alternate terms with `|`."},
                             "glob": {"type": "string", "description": "Optional glob filter."},
                             "path": {"type": "string", "description": "Optional path scope."}
                         },
@@ -155,12 +141,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "find_file_tool",
-                    "description": "Find file paths by glob; use `|` to try multiple patterns.",
+                    "description": "Find file paths by glob to establish coverage or locate targets; use `|` to try multiple patterns.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "pattern": {"type": "string", "description": "Glob pattern or pipe-separated alternatives."},
-                            "include_metadata": {"type": "boolean", "description": "Include small-file metadata."}
+                            "include_metadata": {"type": "boolean", "description": "Include small-file metadata that can help plan chunk sizes or full coverage."}
                         },
                         "required": ["pattern"]
                     }
@@ -361,7 +347,7 @@ impl BuiltinToolRegistry {
             .get("limit")
             .and_then(Value::as_u64)
             .map(|v| v as usize)
-            .unwrap_or(200);
+            .unwrap_or(400);
         let content = match fs::read_file(&self.workspace_cwd, path) {
             Ok(content) => content,
             Err(error) => {
@@ -380,102 +366,64 @@ impl BuiltinToolRegistry {
         Ok(file_chunk_lines(&content, start_line, limit, Some(path)))
     }
 
-    fn invoke_read_source_tree(&self, arguments: Map<String, Value>) -> Result<String> {
-        let path = required_string(&arguments, "path")?;
-        let max_files = arguments
-            .get("max_files")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize)
-            .unwrap_or(40)
-            .clamp(1, 100);
-        let per_file_line_limit = arguments
-            .get("per_file_line_limit")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize)
-            .unwrap_or(260)
-            .clamp(1, 1000);
+    fn invoke_list_dir(&self, arguments: Map<String, Value>) -> Result<String> {
+        let path = optional_string(&arguments, "path").unwrap_or(".");
+        let include_metadata = arguments
+            .get("include_metadata")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let entries = fs::list_dir(&self.workspace_cwd, path)?;
+
+        if !include_metadata {
+            return Ok(json!({
+                "path": path,
+                "entries": entries,
+                "count": entries.len(),
+                "hint": "Use the exact entry string as the path argument. Preserve punctuation and leading characters exactly as shown."
+            })
+            .to_string());
+        }
 
         let directory = fs::safe_path(&self.workspace_cwd, path)?;
-        if !directory.is_dir() {
-            bail!("read_source_tree_tool path is not a directory: {path}");
-        }
-
-        let mut files = Vec::new();
-        collect_source_tree_files(&directory, &mut files)?;
-        files.sort();
-
-        let mut omitted_files = Vec::new();
-        if files.len() > max_files {
-            omitted_files = files.split_off(max_files);
-        }
-
-        let mut file_outputs = Vec::new();
-        let mut files_read = Vec::new();
-        for absolute in files {
-            let relative = absolute
-                .strip_prefix(&self.workspace_cwd)
-                .unwrap_or(&absolute)
-                .display()
-                .to_string();
-            let content = std::fs::read_to_string(&absolute)
-                .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", relative))?;
-            let total_lines = content.lines().count();
-            let complete = total_lines <= per_file_line_limit;
-            let chunk = file_chunk_lines(&content, 1, per_file_line_limit, Some(&relative));
-            files_read.push(relative.clone());
-            file_outputs.push(json!({
-                "path": relative,
+        let mut enriched_entries = Vec::new();
+        for entry in entries {
+            let entry_path = directory.join(&entry);
+            let quoted = quote_json_string(&entry);
+            let metadata = std::fs::metadata(&entry_path).ok();
+            let kind = metadata
+                .as_ref()
+                .map(|m| {
+                    if m.is_dir() {
+                        "directory"
+                    } else if m.is_file() {
+                        "file"
+                    } else {
+                        "other"
+                    }
+                })
+                .unwrap_or("unknown");
+            let size_bytes = metadata.as_ref().map(|m| m.len());
+            let total_lines = if kind == "file" {
+                std::fs::read_to_string(&entry_path)
+                    .ok()
+                    .map(|content| content.lines().count())
+            } else {
+                None
+            };
+            enriched_entries.push(json!({
+                "name": entry,
+                "quoted": quoted,
+                "kind": kind,
+                "size_bytes": size_bytes,
                 "total_lines": total_lines,
-                "line_limit": per_file_line_limit,
-                "complete": complete,
-                "content": chunk,
-                "next_start_line": if complete { Value::Null } else { json!(per_file_line_limit + 1) },
             }));
         }
 
-        let omitted_files = omitted_files
-            .iter()
-            .map(|absolute| {
-                absolute
-                    .strip_prefix(&self.workspace_cwd)
-                    .unwrap_or(absolute)
-                    .display()
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
-        let complete = omitted_files.is_empty()
-            && file_outputs
-                .iter()
-                .all(|file| file["complete"].as_bool().unwrap_or(false));
-
-        Ok(json!({
-            "tool": "read_source_tree_tool",
-            "path": path,
-            "files_read": files_read,
-            "files": file_outputs,
-            "complete": complete,
-            "omitted_files": omitted_files,
-        })
-        .to_string())
-    }
-
-    fn invoke_list_dir(&self, arguments: Map<String, Value>) -> Result<String> {
-        let path = optional_string(&arguments, "path").unwrap_or(".");
-        let entries = fs::list_dir(&self.workspace_cwd, path)?;
-        let quoted_entries = entries
-            .iter()
-            .map(|name| {
-                json!({
-                    "name": name,
-                    "quoted": quote_for_display(name),
-                })
-            })
-            .collect::<Vec<_>>();
         Ok(json!({
             "path": path,
-            "entries": quoted_entries,
-            "count": entries.len(),
-            "hint": "Use the exact `name` value as the path argument. Preserve punctuation and leading characters exactly as shown."
+            "entries": enriched_entries,
+            "count": enriched_entries.len(),
+            "hint": "Use the exact name as the path argument. Preserve punctuation and leading characters exactly as shown."
         })
         .to_string())
     }
@@ -529,22 +477,38 @@ impl BuiltinToolRegistry {
             let mut matches = Vec::new();
             for pattern in split_pipe_alternatives(pattern) {
                 let output = fs::find_files(&self.workspace_cwd, pattern, false)?;
-                if output.starts_with("No files matching `") {
+                let parsed: Value = serde_json::from_str(&output).unwrap_or_else(|_| json!({}));
+                if parsed.get("count").and_then(Value::as_u64).unwrap_or(0) == 0 {
                     continue;
                 }
-                for line in output.lines() {
-                    if !matches.iter().any(|existing| existing == line) {
-                        matches.push(line.to_owned());
+                if let Some(files) = parsed.get("files").and_then(Value::as_array) {
+                    for file in files {
+                        let Some(path) = file.as_str() else {
+                            continue;
+                        };
+                        if !matches.iter().any(|existing| existing == path) {
+                            matches.push(path.to_owned());
+                        }
                     }
                 }
             }
             matches.sort();
             return Ok(if matches.is_empty() {
-                "No files found.".to_owned()
+                json!({
+                    "pattern": pattern,
+                    "count": 0,
+                    "files": [],
+                })
+                .to_string()
             } else if include_metadata {
                 render_find_file_metadata(&self.workspace_cwd, pattern, &matches)
             } else {
-                matches.join("\n")
+                json!({
+                    "pattern": pattern,
+                    "count": matches.len(),
+                    "files": matches,
+                })
+                .to_string()
             });
         }
         fs::find_files(&self.workspace_cwd, pattern, include_metadata)
@@ -856,7 +820,6 @@ impl ToolExecutor for BuiltinToolRegistry {
     async fn invoke(&self, name: &str, arguments: Map<String, Value>) -> Result<String> {
         match name {
             "read_file_tool" => self.invoke_read_file(arguments),
-            "read_source_tree_tool" => self.invoke_read_source_tree(arguments),
             "list_dir_tool" => self.invoke_list_dir(arguments),
             "search_code_tool" => self.invoke_search_code(arguments),
             "find_file_tool" => self.invoke_find_file(arguments),
@@ -1142,20 +1105,14 @@ fn file_chunk_lines(content: &str, start_line: usize, limit: usize, path: Option
         }
     } else {
         let next_start_line = to + 1;
-        let mut metadata = Map::new();
-        if let Some(path) = path {
-            metadata.insert("path".to_owned(), Value::String(path.to_owned()));
+        match path {
+            Some(path) => format!(
+                "{chunk}\n[Continue at line {next_start_line} for {path}. Showing lines {start_line}–{to} of {total}.]"
+            ),
+            None => format!(
+                "{chunk}\n[Continue at line {next_start_line}. Showing lines {start_line}–{to} of {total}.]"
+            ),
         }
-        metadata.insert("content".to_owned(), Value::String(chunk.clone()));
-        metadata.insert("start_line".to_owned(), json!(start_line));
-        metadata.insert("end_line".to_owned(), json!(to));
-        metadata.insert("total_lines".to_owned(), json!(total));
-        metadata.insert("complete".to_owned(), Value::Bool(false));
-        metadata.insert("truncated".to_owned(), Value::Bool(true));
-        metadata.insert("next_start_line".to_owned(), json!(next_start_line));
-        metadata.insert("remaining_lines".to_owned(), json!(total - to));
-        serde_json::to_string_pretty(&Value::Object(metadata))
-            .unwrap_or_else(|_| format!("{chunk}\n[truncated]"))
     }
 }
 
@@ -1167,59 +1124,18 @@ fn file_preview(content: &str) -> String {
     file_chunk_lines(content, 1, 80, None)
 }
 
-fn collect_source_tree_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(directory)
-        .map_err(|error| anyhow::anyhow!("failed to list {}: {error}", directory.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if fs::IGNORED_LIST_DIR_NAMES.contains(&name) || name.starts_with('.') {
-            continue;
-        }
-
-        if path.is_dir() {
-            collect_source_tree_files(&path, files)?;
-        } else if is_source_tree_text_file(&path) {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn is_source_tree_text_file(path: &Path) -> bool {
-    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-        return false;
-    };
-    matches!(
-        extension,
-        "rs" | "md"
-            | "toml"
-            | "json"
-            | "yaml"
-            | "yml"
-            | "txt"
-            | "py"
-            | "js"
-            | "ts"
-            | "tsx"
-            | "jsx"
-            | "html"
-            | "css"
-            | "sh"
-    )
+fn quote_json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
 }
 
 fn render_find_file_metadata(cwd: &Path, pattern: &str, paths: &[String]) -> String {
     if paths.len() > fs::MAX_FIND_METADATA_FILES {
         return json!({
             "pattern": pattern,
+            "files": paths,
+            "count": paths.len(),
             "metadata_included": false,
             "metadata_omitted_reason": format!("matched {} files; metadata is only included for up to {} files", paths.len(), fs::MAX_FIND_METADATA_FILES),
-            "files": paths,
         })
         .to_string();
     }
@@ -1242,6 +1158,7 @@ fn render_find_file_metadata(cwd: &Path, pattern: &str, paths: &[String]) -> Str
 
     json!({
         "pattern": pattern,
+        "count": paths.len(),
         "metadata_included": true,
         "files": files,
         "hint": "Use line_count as a planning aid: narrow lookups can stay targeted, while broad understanding may justify larger read_file_tool limits or consecutive reads."
@@ -1596,7 +1513,6 @@ mod tests {
             names,
             vec![
                 "read_file_tool",
-                "read_source_tree_tool",
                 "list_dir_tool",
                 "search_code_tool",
                 "find_file_tool",
@@ -1617,7 +1533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_source_tree_tool_reads_multiple_text_files() {
+    async fn list_dir_tool_returns_enriched_entries() {
         let tempdir = TempDir::new().expect("tempdir");
         stdfs::create_dir_all(tempdir.path().join("src/nested")).expect("mkdir");
         stdfs::write(tempdir.path().join("src/main.rs"), "fn main() {}\n").expect("write main");
@@ -1631,8 +1547,8 @@ mod tests {
 
         let result = registry
             .invoke(
-                "read_source_tree_tool",
-                json!({"path": "src", "per_file_line_limit": 20})
+                "list_dir_tool",
+                json!({"path": "src", "include_metadata": true})
                     .as_object()
                     .cloned()
                     .unwrap(),
@@ -1642,14 +1558,27 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).expect("json result");
 
         assert_eq!(parsed["path"], "src");
-        assert_eq!(parsed["files_read"].as_array().unwrap().len(), 2);
-        assert!(result.contains("src/main.rs"));
-        assert!(result.contains("src/nested/lib.rs"));
-        assert!(!result.contains("image.bin"));
+        assert!(parsed["entries"].is_array());
+        let entries = parsed["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|entry| entry["name"] == "main.rs"));
+        assert!(entries.iter().any(|entry| entry["name"] == "nested"));
+        let main = entries
+            .iter()
+            .find(|entry| entry["name"] == "main.rs")
+            .expect("main.rs entry");
+        assert_eq!(main["kind"], "file");
+        assert_eq!(main["total_lines"], 1);
+        assert!(main["quoted"].as_str().unwrap().contains("main.rs"));
+        let bin = entries
+            .iter()
+            .find(|entry| entry["name"] == "image.bin")
+            .expect("image.bin entry");
+        assert_eq!(bin["kind"], "file");
+        assert_eq!(bin["total_lines"], 1);
     }
 
     #[test]
-    fn list_dir_tool_returns_structured_entries_with_quoted_names() {
+    fn list_dir_tool_returns_structured_entries() {
         let tempdir = TempDir::new().expect("tempdir");
         let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
         stdfs::create_dir_all(tempdir.path().join("normal")).expect("mkdir");
@@ -1671,7 +1600,14 @@ mod tests {
                 .as_array()
                 .expect("entries")
                 .iter()
-                .any(|entry| entry["name"] == "`.gemma" && entry["quoted"] == "\"`.gemma\"")
+                .all(|entry| entry["name"].is_string())
+        );
+        assert!(
+            parsed["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| entry["name"].as_str() == Some("`.gemma"))
         );
         assert!(
             parsed["hint"]
@@ -1700,8 +1636,10 @@ mod tests {
                 .expect("limit description");
 
         assert!(description.contains("Read workspace file lines"));
+        assert!(description.contains("full-file coverage"));
         assert!(limit_description.contains("Maximum lines to return"));
         assert!(limit_description.contains("broad understanding"));
+        assert!(limit_description.contains("full-file audits"));
     }
 
     #[test]
@@ -1719,6 +1657,7 @@ mod tests {
             .expect("description");
 
         assert!(description.contains("Search file contents with ripgrep"));
+        assert!(description.contains("symbols or exact text"));
         assert!(description.contains("`|` to join alternate terms"));
 
         let query_description =
@@ -1726,6 +1665,7 @@ mod tests {
                 .as_str()
                 .expect("query description");
         assert!(query_description.contains("Ripgrep regex"));
+        assert!(query_description.contains("symbols"));
         assert!(query_description.contains("`|`"));
     }
 
@@ -1748,7 +1688,33 @@ mod tests {
                 .expect("include_metadata description");
 
         assert!(description.contains("Find file paths by glob"));
-        assert!(metadata_description.contains("Include small-file metadata"));
+        assert!(description.contains("establish coverage"));
+        assert!(metadata_description.contains("chunk sizes or full coverage"));
+    }
+
+    #[test]
+    fn list_dir_tool_schema_mentions_metadata() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        let schemas = registry.tool_schemas();
+        let tree_schema = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == "list_dir_tool")
+            .expect("list_dir_tool schema");
+
+        let description = tree_schema["function"]["description"]
+            .as_str()
+            .expect("description");
+        let metadata_description =
+            tree_schema["function"]["parameters"]["properties"]["include_metadata"]["description"]
+                .as_str()
+                .expect("include_metadata description");
+
+        assert!(description.contains("List workspace file and directory names"));
+        assert!(description.contains("optional metadata"));
+        assert!(description.contains("broad directory audits"));
+        assert!(metadata_description.contains("file kind"));
+        assert!(metadata_description.contains("line count"));
     }
 
     // -----------------------------------------------------------------------
@@ -2351,56 +2317,24 @@ Body text.
     fn read_file_tool_paginates_large_content() {
         let tempdir = TempDir::new().expect("tempdir");
         let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
-        // 450 lines — more than the default 200-line limit.
+        // 450 lines — more than the default 400-line limit.
         let large = (1..=450)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
         stdfs::write(tempdir.path().join("large.txt"), &large).expect("write large file");
 
-        // First read: default start_line=1, limit=200.
+        // First read: default start_line=1, limit=400.
         let page1 = futures::executor::block_on(registry.invoke(
             "read_file_tool",
             json!({"path": "large.txt"}).as_object().cloned().unwrap(),
         ))
         .expect("invoke page 1");
-        let page1_json: serde_json::Value = serde_json::from_str(&page1).expect("page 1 metadata");
-        assert_eq!(page1_json["start_line"], 1);
-        assert_eq!(page1_json["end_line"], 200);
-        assert_eq!(page1_json["total_lines"], 450);
-        assert_eq!(page1_json["complete"], false);
-        assert_eq!(page1_json["truncated"], true);
-        assert_eq!(page1_json["next_start_line"], 201);
-        assert_eq!(page1_json["remaining_lines"], 250);
-        assert!(
-            page1_json["content"]
-                .as_str()
-                .expect("content")
-                .contains("200: line 200"),
-            "page 1 should include numbered content: {page1}"
-        );
+        assert!(page1.contains("400: line 400"), "page 1: {page1}");
+        assert!(page1.contains("Continue at line 401"), "page 1: {page1}");
 
-        // Second read: start_line=201 gets lines 201-400.
+        // Second read: start_line=401 gets the rest.
         let page2 = futures::executor::block_on(
-            registry.invoke(
-                "read_file_tool",
-                json!({"path": "large.txt", "start_line": 201})
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-            ),
-        )
-        .expect("invoke page 2");
-        let page2_json: serde_json::Value = serde_json::from_str(&page2).expect("page 2 metadata");
-        assert_eq!(page2_json["start_line"], 201);
-        assert_eq!(page2_json["end_line"], 400);
-        assert_eq!(page2_json["complete"], false);
-        assert_eq!(page2_json["truncated"], true);
-        assert_eq!(page2_json["next_start_line"], 401);
-        assert_eq!(page2_json["remaining_lines"], 50);
-
-        // Third read: start_line=401 gets the rest.
-        let page3 = futures::executor::block_on(
             registry.invoke(
                 "read_file_tool",
                 json!({"path": "large.txt", "start_line": 401})
@@ -2409,10 +2343,10 @@ Body text.
                     .unwrap(),
             ),
         )
-        .expect("invoke page 3");
+        .expect("invoke page 2");
         assert!(
-            page3.contains("End of file"),
-            "page 3 should reach end: {page3}"
+            page2.contains("End of file"),
+            "page 2 should reach end: {page2}"
         );
 
         // Small file: returned whole, no continuation notice.
@@ -2646,6 +2580,7 @@ Body text.
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("metadata result should be json");
 
+        assert_eq!(parsed["count"], 1);
         assert_eq!(parsed["metadata_included"], true);
         assert_eq!(parsed["files"][0]["path"], "src/acp.rs");
         assert_eq!(parsed["files"][0]["line_count"], 2);
@@ -2682,6 +2617,7 @@ Body text.
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("metadata result should be json");
 
+        assert_eq!(parsed["count"], 2);
         assert_eq!(parsed["metadata_included"], true);
         assert_eq!(parsed["files"].as_array().expect("files").len(), 2);
         assert!(

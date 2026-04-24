@@ -191,10 +191,6 @@ pub fn find_files(cwd: &Path, pattern: &str, include_metadata: bool) -> Result<S
     let mut paths: Vec<&str> = stdout.lines().collect();
     paths.sort();
 
-    if paths.is_empty() {
-        return Ok(format!("No files matching `{pattern}`."));
-    }
-
     let relative: Vec<String> = paths
         .iter()
         .map(|p| {
@@ -206,10 +202,20 @@ pub fn find_files(cwd: &Path, pattern: &str, include_metadata: bool) -> Result<S
         })
         .collect();
 
+    if relative.is_empty() {
+        return Ok(json!({
+            "pattern": pattern,
+            "count": 0,
+            "files": []
+        })
+        .to_string());
+    }
+
     if include_metadata {
         if relative.len() > MAX_FIND_METADATA_FILES {
             return Ok(json!({
                 "pattern": pattern,
+                "count": relative.len(),
                 "metadata_included": false,
                 "metadata_omitted_reason": format!("matched {} files; metadata is only included for up to {} files", relative.len(), MAX_FIND_METADATA_FILES),
                 "files": relative,
@@ -235,14 +241,20 @@ pub fn find_files(cwd: &Path, pattern: &str, include_metadata: bool) -> Result<S
 
         return Ok(json!({
             "pattern": pattern,
+            "count": relative.len(),
             "metadata_included": true,
             "files": files,
-            "hint": "Use line_count as a planning aid: narrow lookups can stay targeted, while broad understanding may justify larger read_file_tool limits or consecutive reads."
+            "hint": "Use line_count as a planning aid: narrow lookups can stay targeted, while broad audits may justify larger read_file_tool limits, consecutive reads, or source-tree reads for full coverage."
         })
         .to_string());
     }
 
-    Ok(relative.join("\n"))
+    Ok(json!({
+        "pattern": pattern,
+        "count": relative.len(),
+        "files": relative,
+    })
+    .to_string())
 }
 
 pub fn delete_path(cwd: &Path, path: &str, recursive: bool) -> Result<String> {
