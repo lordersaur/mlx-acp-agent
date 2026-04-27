@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
-use crate::model_parser::extract_thought_blocks;
+use crate::model_parser::{clean_streaming_answer, clean_streaming_chunk, extract_thought_blocks};
 
 // ---------------------------------------------------------------------------
 // Wire-format message types
@@ -478,10 +478,43 @@ fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<St
                 }
             }
             ThinkState::After => {
-                if !state.buf.is_empty() {
-                    events.push(StreamEvent::Answer(std::mem::take(&mut state.buf)));
+                // Handle stray thought blocks the model re-opens after the first close.
+                let earliest_open = earliest_tag(&state.buf, &[OPEN_GEMMA_THINK, OPEN_CHANNEL]);
+                if let Some((oi, open_tag)) = earliest_open {
+                    let open_end = oi + open_tag.len();
+                    let mut inner = state.buf[open_end..].to_owned();
+                    strip_leading_channel_separator(&mut inner);
+                    if let Some((ci, close_tag)) =
+                        earliest_tag(&inner, &[CLOSE_GEMMA_THINK, CLOSE_CHANNEL])
+                    {
+                        // Balanced block: emit prefix as answer, body as thought, skip markers.
+                        if oi > 0 {
+                            events.push(StreamEvent::Answer(state.buf[..oi].to_owned()));
+                        }
+                        let body = inner[..ci].trim().to_owned();
+                        if !body.is_empty() {
+                            events.push(StreamEvent::Thought(body));
+                        }
+                        state.buf = inner[ci + close_tag.len()..].to_owned();
+                        // loop: remain in After, handle whatever follows
+                    } else {
+                        // Open tag but no close yet — emit what's safe before the open.
+                        if oi > 0 {
+                            events.push(StreamEvent::Answer(state.buf[..oi].to_owned()));
+                            state.buf.drain(..oi);
+                        }
+                        break;
+                    }
+                } else {
+                    // No open tags — safe-emit the remainder as answer.
+                    let safe = state.buf.len().saturating_sub(MAX_TAG_LEN - 1);
+                    let safe = floor_char_boundary(&state.buf, safe);
+                    if safe > 0 {
+                        events.push(StreamEvent::Answer(state.buf[..safe].to_owned()));
+                        state.buf.drain(..safe);
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
@@ -508,16 +541,24 @@ fn finish_content_stream(state: &mut ContentStreamState) -> Vec<StreamEvent> {
 }
 
 fn stream_answer_chunk(
-    state: &mut AnswerStreamState,
+    _state: &mut AnswerStreamState,
     content: &str,
-    _tx: &mpsc::UnboundedSender<String>,
+    tx: &mpsc::UnboundedSender<String>,
 ) {
-    state.buf.push_str(content);
+    if content.is_empty() {
+        return;
+    }
+    // Strip any stray thought markers from the chunk without trimming so
+    // whitespace tokens ("Hello ") are preserved across the stream.
+    let text = clean_streaming_chunk(content);
+    if !text.is_empty() {
+        tx.send(text).ok();
+    }
 }
 
 fn flush_answer_stream(state: &mut AnswerStreamState, tx: &mpsc::UnboundedSender<String>) {
     if !state.buf.is_empty() {
-        let text = clean_model_text(&std::mem::take(&mut state.buf));
+        let text = clean_streaming_answer(&std::mem::take(&mut state.buf));
         if !text.is_empty() {
             tx.send(text).ok();
         }
@@ -650,7 +691,7 @@ fn value_to_string(value: &Value) -> String {
 mod tests {
     use super::{
         AnswerStreamState, ContentStreamState, StreamEvent, clean_model_text,
-        finish_content_stream, flush_answer_stream, stream_answer_chunk, stream_content_chunk,
+        finish_content_stream, stream_answer_chunk, stream_content_chunk,
     };
     use tokio::sync::mpsc;
 
@@ -774,75 +815,39 @@ mod tests {
     }
 
     #[test]
-    fn stream_answer_chunk_preserves_tool_call_text() {
+    fn stream_answer_chunk_sends_immediately() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = AnswerStreamState::default();
 
-        stream_answer_chunk(&mut state, "I will inspect. <|tool", &tx);
-        stream_answer_chunk(&mut state, "_call>call:read_file_tool{}", &tx);
-        flush_answer_stream(&mut state, &tx);
+        stream_answer_chunk(&mut state, "Hello ", &tx);
+        assert_eq!(rx.try_recv().unwrap(), "Hello ");
 
-        let mut answer = String::new();
-        while let Ok(chunk) = rx.try_recv() {
-            answer.push_str(&chunk);
-        }
-        assert_eq!(answer, "I will inspect. <|tool_call>call:read_file_tool{}");
+        stream_answer_chunk(&mut state, "world.", &tx);
+        assert_eq!(rx.try_recv().unwrap(), "world.");
     }
 
     #[test]
-    fn stream_answer_chunk_holds_short_answer_until_flush() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AnswerStreamState::default();
-
-        stream_answer_chunk(&mut state, "Final ", &tx);
-        stream_answer_chunk(&mut state, "answer.", &tx);
-
-        assert!(rx.try_recv().is_err());
-
-        flush_answer_stream(&mut state, &tx);
-
-        let mut answer = String::new();
-        while let Ok(chunk) = rx.try_recv() {
-            answer.push_str(&chunk);
-        }
-        assert_eq!(answer, "Final answer.");
-    }
-
-    #[test]
-    fn stream_answer_flush_strips_gemma_channel_leak() {
+    fn stream_answer_chunk_sanitizes_raw_combined_content() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = AnswerStreamState::default();
 
         stream_answer_chunk(
             &mut state,
-            "<|channel>thought\nThe user greeted us.<channel|>Hello! How can I help?",
+            "<|channel>thought\nI am thinking.\n<channel|>Hello! How can I help?",
             &tx,
         );
-        flush_answer_stream(&mut state, &tx);
-
-        let mut answer = String::new();
-        while let Ok(chunk) = rx.try_recv() {
-            answer.push_str(&chunk);
-        }
-        assert_eq!(answer, "Hello! How can I help?");
+        assert_eq!(rx.try_recv().unwrap(), "Hello! How can I help?");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn stream_answer_chunk_buffers_long_answer_until_flush() {
+    fn stream_answer_chunk_long_answer_streams_immediately() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = AnswerStreamState::default();
-        let long_answer = format!("{}{}", "a".repeat(600), " done");
 
-        stream_answer_chunk(&mut state, &long_answer, &tx);
-
-        assert!(rx.try_recv().is_err());
-
-        flush_answer_stream(&mut state, &tx);
-        let mut answer = String::new();
-        while let Ok(chunk) = rx.try_recv() {
-            answer.push_str(&chunk);
-        }
-        assert_eq!(answer, long_answer);
+        stream_answer_chunk(&mut state, &"a".repeat(600), &tx);
+        // Sent immediately — no need to flush.
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]

@@ -100,7 +100,7 @@ impl BuiltinToolRegistry {
                         "properties": {
                             "path": {"type": "string", "description": "File path."},
                             "start_line": {"type": "integer", "description": "1-based line number."},
-                            "limit": {"type": "integer", "description": "Maximum lines to return; larger limits can help for broad understanding, full-file audits, or fewer sequential reads."}
+                            "limit": {"type": "integer", "description": "Maximum lines to return (capped at 1200). Use 1200 for broad understanding or full-file audits of large files; use smaller values for targeted reads."}
                         },
                         "required": ["path"]
                     }
@@ -141,7 +141,7 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "find_file_tool",
-                    "description": "Find file paths by glob to establish coverage or locate targets; use `|` to try multiple patterns.",
+                    "description": "Find file paths by glob when the location is unknown; use `|` to try multiple patterns. Do not use to locate a file the user has explicitly named — read that file directly instead.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -347,7 +347,8 @@ impl BuiltinToolRegistry {
             .get("limit")
             .and_then(Value::as_u64)
             .map(|v| v as usize)
-            .unwrap_or(400);
+            .unwrap_or(800)
+            .min(1200);
         let content = match fs::read_file(&self.workspace_cwd, path) {
             Ok(content) => content,
             Err(error) => {
@@ -1638,6 +1639,7 @@ mod tests {
         assert!(description.contains("Read workspace file lines"));
         assert!(description.contains("full-file coverage"));
         assert!(limit_description.contains("Maximum lines to return"));
+        assert!(limit_description.contains("capped at 1200"));
         assert!(limit_description.contains("broad understanding"));
         assert!(limit_description.contains("full-file audits"));
     }
@@ -1688,7 +1690,7 @@ mod tests {
                 .expect("include_metadata description");
 
         assert!(description.contains("Find file paths by glob"));
-        assert!(description.contains("establish coverage"));
+        assert!(description.contains("location is unknown"));
         assert!(metadata_description.contains("chunk sizes or full coverage"));
     }
 
@@ -2317,21 +2319,21 @@ Body text.
     fn read_file_tool_paginates_large_content() {
         let tempdir = TempDir::new().expect("tempdir");
         let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
-        // 450 lines — more than the default 400-line limit.
-        let large = (1..=450)
+        // 900 lines — more than the default 800-line limit.
+        let large = (1..=900)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
         stdfs::write(tempdir.path().join("large.txt"), &large).expect("write large file");
 
-        // First read: default start_line=1, limit=400.
+        // First read: default start_line=1, limit=800.
         let page1 = futures::executor::block_on(registry.invoke(
             "read_file_tool",
             json!({"path": "large.txt"}).as_object().cloned().unwrap(),
         ))
         .expect("invoke page 1");
-        assert!(page1.contains("400: line 400"), "page 1: {page1}");
-        assert!(page1.contains("Continue at line 401"), "page 1: {page1}");
+        assert!(page1.contains("800: line 800"), "page 1: {page1}");
+        assert!(page1.contains("Continue at line 801"), "page 1: {page1}");
 
         // Second read: start_line=401 gets the rest.
         let page2 = futures::executor::block_on(

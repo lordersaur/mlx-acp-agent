@@ -22,10 +22,11 @@ Treat returned source content as the material to analyze immediately; do not wai
 When coverage is complete, stop gathering and write the requested analysis or refactor plan immediately.
 Do not restate the audit plan after coverage is complete.
 When files are independent, read in parallel.
-For file or module understanding, read before searching.
-For narrow lookups, search first with `|`-separated alternates, then read the relevant lines.
+When the user names a specific file, read it directly with `read_file_tool` — do not list or search first.
+For file or module understanding without a named file, use `list_dir_tool` to locate it, then read.
+For narrow symbol lookups, go straight to `search_code_tool` — no directory listing needed first. Then read the relevant lines.
 Use line counts only to size reads.
-Do not emit Gemma control tokens, ACP thinking tags, or tool-call syntax in user-visible answers.
+Before changing a public function's signature, return type, or name, use `search_code_tool` to find all call sites first and update them in the same change.
 If unsure, say so.
 ";
 // ---------------------------------------------------------------------------
@@ -146,7 +147,9 @@ impl Default for AgentLoopOptions {
             max_iterations: 16,
             max_tokens: 3200,
             temperature: 1.0,
-            max_parallel_tool_calls: 8,
+            // Gemma 4 emits at most 3 tool calls per turn (enforced by Python server).
+            // Keep Rust in sync so the truncation logic here is never a surprise.
+            max_parallel_tool_calls: 3,
         }
     }
 }
@@ -287,7 +290,11 @@ pub async fn run_agent_loop(
                     }
                     Some(chunk) = answer_rx.recv() => {
                         if !chunk.is_empty() {
-                            answer_chunks.push(chunk);
+                            answer_chunks.push(chunk.clone());
+                            if let Some(ref mut handler) = on_thought {
+                                answer_streamed = true;
+                                handler.on_answer_chunk(&chunk).await;
+                            }
                         }
                     }
                 }
@@ -302,7 +309,11 @@ pub async fn run_agent_loop(
         }
         while let Ok(chunk) = answer_rx.try_recv() {
             if !chunk.is_empty() {
-                answer_chunks.push(chunk);
+                answer_chunks.push(chunk.clone());
+                if let Some(ref mut handler) = on_thought {
+                    answer_streamed = true;
+                    handler.on_answer_chunk(&chunk).await;
+                }
             }
         }
 
@@ -338,13 +349,6 @@ pub async fn run_agent_loop(
             let answer = clean_text
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_default();
-
-            if let Some(handler) = on_thought.as_deref_mut() {
-                for chunk in &answer_chunks {
-                    answer_streamed = true;
-                    handler.on_answer_chunk(chunk).await;
-                }
-            }
 
             return Ok(LoopResult {
                 answer,
@@ -399,8 +403,20 @@ pub async fn run_agent_loop(
         }
 
         // Push tool result messages with matching tool_call_id.
+        // Cap individual results so a single oversized read cannot flood the context.
+        const MAX_RESULT_CHARS: usize = 200_000;
         for exec in &executions {
-            conversation.push(ChatMessage::tool_result(&exec.id, exec.result.clone()));
+            let result = if exec.result.len() > MAX_RESULT_CHARS {
+                format!(
+                    "{}\n[Result truncated: {} chars total, showing first {}. Read smaller chunks.]",
+                    &exec.result[..MAX_RESULT_CHARS],
+                    exec.result.len(),
+                    MAX_RESULT_CHARS,
+                )
+            } else {
+                exec.result.clone()
+            };
+            conversation.push(ChatMessage::tool_result(&exec.id, result));
         }
 
         if let Some(summary) =
@@ -1300,8 +1316,8 @@ Run `cargo test`.<tool_call|>"#,
         assert!(SYSTEM_PROMPT.contains("Do not restate the audit plan after coverage is complete"));
         assert!(SYSTEM_PROMPT.contains("When files are independent, read in parallel"));
         assert!(SYSTEM_PROMPT.contains("For file or module understanding"));
-        assert!(SYSTEM_PROMPT.contains("search first with `|`-separated alternates"));
+        assert!(SYSTEM_PROMPT.contains("go straight to `search_code_tool`"));
         assert!(SYSTEM_PROMPT.contains("Use line counts only to size reads"));
-        assert!(SYSTEM_PROMPT.contains("Do not emit Gemma control tokens"));
+        assert!(SYSTEM_PROMPT.contains("find all call sites first and update them in the same change"));
     }
 }

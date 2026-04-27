@@ -1,10 +1,10 @@
 use std::env;
 
-pub const DEFAULT_MLX_URL: &str = "http://127.0.0.1:8000/v1/chat/completions";
-pub const DEFAULT_MODEL_NAME: &str = "mlx-community/gemma-4-e4b-it-OptiQ-4bit";
-// pub const DEFAULT_MODEL_NAME: &str = "mlx-community/gpt-oss-20b-MXFP4-Q4";
+pub const MLX_BASE_URL: &str = "http://127.0.0.1:8000/v1/chat/completions";
+pub const DEFAULT_MODEL_NAME: &str = "unsloth/gemma-4-E4B-it-MLX-8bit";
 pub const STALE_MODEL_ALIASES: &[&str] = &["mlx", "mlx-community"];
 
+/// Configuration structure for the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub mlx_url: String,
@@ -13,7 +13,7 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Self {
-        let mlx_url = env::var("MLX_URL").unwrap_or_else(|_| DEFAULT_MLX_URL.to_owned());
+        let mlx_url = env::var("MLX_URL").unwrap_or_else(|_| MLX_BASE_URL.to_owned());
         let configured_model = env::var("MLX_MODEL").ok();
         let mlx_model = resolve_model_name(configured_model.as_deref());
 

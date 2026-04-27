@@ -13,12 +13,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::agent_loop::{
     AgentLoopOptions, ConversationMessage, ModelClient, SYSTEM_PROMPT, ThoughtHandler,
     ToolExecutor, run_agent_loop,
 };
-use crate::model_parser::extract_thought_blocks;
+use crate::model_parser::{clean_streaming_chunk, extract_thought_blocks};
 use crate::session_store::{
     CommandSessionInfo, SessionState, build_turn_record, new_session, update_command_sessions,
 };
@@ -28,7 +29,7 @@ use crate::tools::{BuiltinToolRegistry, ToolProgressEvent, ToolProgressSink};
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_HISTORY_TURNS: usize = 6;
+const MAX_HISTORY_TURNS: usize = 10;
 const MAX_TURN_CHARS: usize = 3500;
 const PROTOCOL_VERSION: u64 = 1;
 
@@ -147,6 +148,7 @@ fn spawn_loop(
     model: Arc<dyn ModelClient>,
     tx: mpsc::UnboundedSender<String>,
     session_id: String,
+    message_id: String,
     messages: Vec<ConversationMessage>,
     progress_registry: ProgressRegistry,
     tool_schemas: Vec<Value>,
@@ -159,6 +161,7 @@ fn spawn_loop(
     let handle = tokio::task::spawn(async move {
         let mut thought_handler = AcpThoughtHandler {
             session_id,
+            message_id,
             tx,
             active_reasoning: Some(active_reasoning),
         };
@@ -238,13 +241,18 @@ impl AcpServer {
     }
 
     fn send_message(&self, session_id: &str, text: &str) {
-        self.send_session_update(
-            session_id,
-            json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": text},
-            }),
-        );
+        self.send_message_with_id(session_id, text, None);
+    }
+
+    fn send_message_with_id(&self, session_id: &str, text: &str, message_id: Option<&str>) {
+        let mut update = json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        });
+        if let Some(message_id) = message_id {
+            update["messageId"] = Value::String(message_id.to_owned());
+        }
+        self.send_session_update(session_id, update);
     }
 
     // -----------------------------------------------------------------------
@@ -486,6 +494,7 @@ impl AcpServer {
         let tool_schemas = registry.tool_schemas();
 
         let my_task_id = self.next_task_id.fetch_add(1, Ordering::SeqCst);
+        let response_message_id = Uuid::new_v4().to_string();
 
         // Share model reasoning between the thought handler and tool executor
         let active_reasoning = Arc::new(Mutex::new(None));
@@ -535,6 +544,7 @@ impl AcpServer {
                         self.model.clone(),
                         self.tx.clone(),
                         session_id.clone(),
+                        response_message_id.clone(),
                         messages,
                         progress_registry,
                         tool_schemas,
@@ -550,6 +560,7 @@ impl AcpServer {
                     self.model.clone(),
                     self.tx.clone(),
                     session_id.clone(),
+                    response_message_id.clone(),
                     messages,
                     progress_registry,
                     tool_schemas,
@@ -630,7 +641,11 @@ impl AcpServer {
                 }
             }
             if !result.answer_streamed {
-                self.send_message(&session_id, &result.answer);
+                self.send_message_with_id(
+                    &session_id,
+                    &result.answer,
+                    Some(&response_message_id),
+                );
             }
         } else {
             // Interrupted or cancelled. The session remains in memory only.
@@ -711,6 +726,7 @@ pub async fn run(model: Arc<dyn ModelClient>) -> Result<()> {
 
 struct AcpThoughtHandler {
     session_id: String,
+    message_id: String,
     tx: mpsc::UnboundedSender<String>,
     active_reasoning: Option<Arc<Mutex<Option<String>>>>,
 }
@@ -746,6 +762,7 @@ impl AcpThoughtHandler {
                 "sessionId": self.session_id,
                 "update": {
                     "sessionUpdate": "agent_thought_chunk",
+                    "messageId": self.message_id,
                     "content": {"type": "text", "text": text},
                 },
             },
@@ -786,12 +803,16 @@ impl ThoughtHandler for AcpThoughtHandler {
     }
 
     async fn on_thought_end(&mut self) {
-        // Flush a separator so Zed visually terminates the streaming thought block.
-        self.send_raw_chunk("\n\n");
+        // messageId groups thought/answer chunks into the same bubble in Zed —
+        // no separator needed; sending one creates a spurious empty thought block.
     }
 
     async fn on_answer_chunk(&mut self, chunk: &str) {
         if chunk.is_empty() {
+            return;
+        }
+        let text = clean_streaming_chunk(chunk);
+        if text.is_empty() {
             return;
         }
         let msg = json!({
@@ -801,7 +822,8 @@ impl ThoughtHandler for AcpThoughtHandler {
                 "sessionId": self.session_id,
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": chunk},
+                    "messageId": self.message_id,
+                    "content": {"type": "text", "text": text},
                 },
             },
         });
@@ -1551,6 +1573,7 @@ Task:
 
 Reminder:
 - Use tools only when needed.
+- If the task names a specific file, read it directly — do not search or list first.
 - Follow the requested output format.
 - Honor explicit constraints and delimiters from the user message exactly.
 - If the user gives examples, match their structure unless they conflict with a stronger instruction."
@@ -1997,6 +2020,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut handler = AcpThoughtHandler {
             session_id: "sess_test".to_owned(),
+            message_id: "msg_test".to_owned(),
             tx,
             active_reasoning: None,
         };
@@ -2012,6 +2036,45 @@ mod tests {
         assert_eq!(thoughts, vec!["The user greeted us."]);
         assert!(!thoughts[0].contains("<|channel>"));
         assert!(!thoughts[0].contains("Hello! How can I help?"));
+    }
+
+    #[tokio::test]
+    async fn acp_thought_handler_strips_thought_tokens_from_answer_chunk() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut handler = AcpThoughtHandler {
+            session_id: "sess_test".to_owned(),
+            message_id: "msg_test".to_owned(),
+            tx,
+            active_reasoning: None,
+        };
+
+        handler
+            .on_answer_chunk(
+                "<|channel>thought\nThe user greeted us.\n<channel|>Hello! How can I help you today?",
+            )
+            .await;
+
+        let updates = drain_updates(&mut rx);
+        let message = updates
+            .iter()
+            .find(|msg| {
+                msg.get("params")
+                    .and_then(|v| v.get("update"))
+                    .and_then(|v| v.get("sessionUpdate"))
+                    .and_then(|v| v.as_str())
+                    == Some("agent_message_chunk")
+            })
+            .expect("agent_message_chunk");
+        let text = message["params"]["update"]["content"]["text"]
+            .as_str()
+            .expect("answer text");
+        assert_eq!(text, "Hello! How can I help you today?");
+        assert_eq!(
+            message["params"]["update"]["messageId"],
+            Value::String("msg_test".to_owned())
+        );
+        assert!(!text.contains("<|channel>"));
+        assert!(!text.contains("The user greeted us."));
     }
 
     #[test]

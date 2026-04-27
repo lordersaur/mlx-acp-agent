@@ -80,6 +80,37 @@ pub fn extract_thought_blocks(raw_text: &str) -> (Vec<String>, String) {
     (thoughts, cleaned)
 }
 
+/// Clean accumulated answer text that has already been separated from a thinking block
+/// by the streaming state machine.
+///
+/// Unlike `clean_model_text`, this does NOT apply the `prefilled_close_patterns` step.
+/// That step matches `^(.*?)<channel\|>(.*)$`, so if the answer text mentions
+/// `<channel|>` in prose (e.g. the model explaining Gemma token format), it treats
+/// everything before that tag as a thought and discards it — silently wiping the answer.
+///
+/// Instead: strip only complete balanced thought blocks, then remove stray markers.
+pub fn clean_streaming_answer(text: &str) -> String {
+    let re_channel =
+        Regex::new(r"(?s)<\|channel>thought(?:[ \t]*\r?\n|[ \t]+)?(.*?)<channel\|>").unwrap();
+    let re_think = Regex::new(r"(?s)<\|think\|>(.*?)<\|/think\|>").unwrap();
+    let s = re_channel.replace_all(text, "");
+    let s = re_think.replace_all(&s, "");
+    strip_residual_meta(&s).trim().to_owned()
+}
+
+/// Like `clean_streaming_answer` but without the final trim.
+///
+/// Use this for individual streaming chunks where whitespace tokens (spaces, newlines
+/// between words) must be preserved — trimming would silently drop the space in "Hello ".
+pub fn clean_streaming_chunk(text: &str) -> String {
+    let re_channel =
+        Regex::new(r"(?s)<\|channel>thought(?:[ \t]*\r?\n|[ \t]+)?(.*?)<channel\|>").unwrap();
+    let re_think = Regex::new(r"(?s)<\|think\|>(.*?)<\|/think\|>").unwrap();
+    let s = re_channel.replace_all(text, "");
+    let s = re_think.replace_all(&s, "");
+    strip_residual_meta(&s).to_owned()
+}
+
 fn strip_residual_meta(text: &str) -> String {
     let drop_meta_lines =
         Regex::new(r"(?m)^\s*(?:<\|channel>|<channel\|>|<\|think\|>|<\|/think\|>).*$").unwrap();
