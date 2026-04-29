@@ -71,6 +71,9 @@ pub struct SessionState {
     pub cwd: String,
     pub mode_id: String,
     pub turns: Vec<TurnRecord>,
+    /// Rolling summary of turns that were evicted from `turns` to keep context bounded.
+    /// Prepended to the model's context on every message so older work isn't lost.
+    pub context_summary: Option<String>,
     pub active_command_sessions: HashMap<String, CommandSessionInfo>,
     /// UI-only: maps event key → external tool-call id
     pub active_tool_calls: HashMap<String, String>,
@@ -87,9 +90,57 @@ pub fn new_session(cwd: &str) -> SessionState {
         cwd: cwd.to_owned(),
         mode_id: "agent".to_owned(),
         turns: Vec::new(),
+        context_summary: None,
         active_command_sessions: HashMap::new(),
         active_tool_calls: HashMap::new(),
         tool_event_counter: 0,
+    }
+}
+
+/// Formats evicted turns into a compact log suitable as input to a summarizer model.
+pub fn format_turns_for_summary(turns: &[TurnRecord]) -> String {
+    let mut lines = Vec::new();
+    for turn in turns {
+        match turn.role.as_str() {
+            "user" => {
+                let content = truncate_str(&turn.content, 300);
+                lines.push(format!("User: {content}"));
+            }
+            "assistant" => {
+                let mut parts: Vec<String> = Vec::new();
+                if !turn.files_changed.is_empty() {
+                    let files: Vec<_> = turn
+                        .files_changed
+                        .iter()
+                        .map(|f| format!("{} ({})", f.path, f.status))
+                        .collect();
+                    parts.push(format!("files: {}", files.join(", ")));
+                }
+                if !turn.commands_run.is_empty() {
+                    parts.push(format!("ran: {}", turn.commands_run.join("; ")));
+                }
+                // Include short answer text if present and not an interruption marker
+                if !turn.content.is_empty()
+                    && !turn
+                        .content
+                        .starts_with("Interrupted: reached the iteration limit")
+                {
+                    parts.push(truncate_str(&turn.content, 200).to_owned());
+                }
+                if !parts.is_empty() {
+                    lines.push(format!("Assistant: {}", parts.join(" | ")));
+                }
+            }
+            _ => {}
+        }
+    }
+    lines.join("\n")
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
     }
 }
 

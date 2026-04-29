@@ -71,6 +71,10 @@ impl BuiltinToolRegistry {
         self
     }
 
+    pub fn model_client(&self) -> Option<Arc<dyn ModelClient>> {
+        self.model.clone()
+    }
+
     fn require_model(&self) -> Result<&dyn ModelClient> {
         self.model
             .as_ref()
@@ -94,13 +98,13 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "read_file_tool",
-                    "description": "Read workspace file lines for inspection, broad understanding, or full-file coverage during audits.",
+                    "description": "Read workspace file lines.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "File path."},
-                            "start_line": {"type": "integer", "description": "1-based line number."},
-                            "limit": {"type": "integer", "description": "Maximum lines to return (capped at 1200). Use 1200 for broad understanding or full-file audits of large files; use smaller values for targeted reads."}
+                            "start_line": {"type": "integer", "description": "1-based start line."},
+                            "limit": {"type": "integer", "description": "Max lines to return (capped at 1200)."}
                         },
                         "required": ["path"]
                     }
@@ -110,12 +114,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "list_dir_tool",
-                    "description": "List workspace file and directory names, with optional metadata for files, to establish exact coverage before reading or planning. Use this for broad directory audits and discovery, not as a content-reading tool.",
+                    "description": "List directory contents.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "Directory path."},
-                            "include_metadata": {"type": "boolean", "description": "Include metadata such as file kind, size, and line count when available; useful for planning broad audits."}
+                            "include_metadata": {"type": "boolean", "description": "Include file size and line counts."}
                         },
                         "required": ["path"]
                     }
@@ -125,13 +129,13 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "search_code_tool",
-                    "description": "Search file contents with ripgrep for symbols or exact text; use `|` to join alternate terms.",
+                    "description": "Ripgrep search. Returns 3 lines of context — always follow with read_file_tool at the returned line.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Ripgrep regex for symbols, anchors, or exact text. Join alternate terms with `|`."},
-                            "glob": {"type": "string", "description": "Optional glob filter."},
-                            "path": {"type": "string", "description": "Optional path scope."}
+                            "query": {"type": "string", "description": "Ripgrep regex. Use `|` for alternates."},
+                            "glob": {"type": "string", "description": "Glob filter."},
+                            "path": {"type": "string", "description": "Path scope."}
                         },
                         "required": ["query"]
                     }
@@ -141,12 +145,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "find_file_tool",
-                    "description": "Find file paths by glob when the location is unknown; use `|` to try multiple patterns. Do not use to locate a file the user has explicitly named — read that file directly instead.",
+                    "description": "Find files by glob. Use `|` for multiple patterns.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "pattern": {"type": "string", "description": "Glob pattern or pipe-separated alternatives."},
-                            "include_metadata": {"type": "boolean", "description": "Include small-file metadata that can help plan chunk sizes or full coverage."}
+                            "include_metadata": {"type": "boolean", "description": "Include file size and line counts."}
                         },
                         "required": ["pattern"]
                     }
@@ -154,9 +158,9 @@ impl BuiltinToolRegistry {
             }),
             json!({
                 "type": "function",
-                "function": {
-                    "name": "web_search_tool",
-                    "description": "Search the web.",
+                    "function": {
+                        "name": "web_search_tool",
+                    "description": "Search the web for research or current facts. Searching alone does not imply permission to build.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -169,9 +173,9 @@ impl BuiltinToolRegistry {
             }),
             json!({
                 "type": "function",
-                "function": {
-                    "name": "web_fetch_tool",
-                    "description": "Fetch a URL.",
+                    "function": {
+                        "name": "web_fetch_tool",
+                    "description": "Fetch a URL for source-backed research or inspection.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -183,13 +187,14 @@ impl BuiltinToolRegistry {
             }),
             json!({
                 "type": "function",
-                "function": {
-                    "name": "run_command_tool",
-                    "description": "Run a shell command in the workspace.",
+                    "function": {
+                        "name": "run_command_tool",
+                    "description": "Run one finite shell command. Use cwd for project subdirectories. Do not use for dev servers, watchers, or interactive commands.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "cmd": {"type": "string", "description": "Shell command."}
+                            "cmd": {"type": "string", "description": "Finite shell command."},
+                            "cwd": {"type": "string", "description": "Optional workspace-relative directory."}
                         },
                         "required": ["cmd"]
                     }
@@ -208,13 +213,14 @@ impl BuiltinToolRegistry {
             }),
             json!({
                 "type": "function",
-                "function": {
-                    "name": "start_command_session_tool",
-                    "description": "Start a persistent shell session.",
+                    "function": {
+                        "name": "start_command_session_tool",
+                    "description": "Start a persistent shell session for dev servers, watchers, interactive commands, or commands that need polling. Use cwd for project subdirectories.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "cmd": {"type": "string", "description": "Shell command."}
+                            "cmd": {"type": "string", "description": "Persistent or interactive shell command."},
+                            "cwd": {"type": "string", "description": "Optional workspace-relative directory."}
                         },
                         "required": ["cmd"]
                     }
@@ -301,12 +307,12 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "edit_file_tool",
-                    "description": "Rewrite a small existing file.",
+                    "description": "Rewrite an existing file.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "File path."},
-                            "instruction": {"type": "string", "description": "Edit instruction."}
+                            "instruction": {"type": "string", "description": "Complete new file content."}
                         },
                         "required": ["path", "instruction"]
                     }
@@ -316,15 +322,14 @@ impl BuiltinToolRegistry {
                 "type": "function",
                 "function": {
                     "name": "create_artifact_tool",
-                    "description": "Create a new file.",
+                    "description": "Create a new file. Pass the complete content in `instruction`.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "instruction": {"type": "string", "description": "File contents."},
-                            "filename": {"type": "string", "description": "Filename or path."},
-                            "kind": {"type": "string", "description": "Optional file kind hint."}
+                            "instruction": {"type": "string", "description": "Complete file content."},
+                            "filename": {"type": "string", "description": "Filename or path."}
                         },
-                        "required": ["instruction"]
+                        "required": ["instruction", "filename"]
                     }
                 }
             }),
@@ -531,13 +536,46 @@ impl BuiltinToolRegistry {
 
     fn invoke_run_command(&self, arguments: Map<String, Value>) -> Result<String> {
         let cmd = required_string(&arguments, "cmd")?;
-        command::run_command(&self.cmd_sessions, &self.workspace_cwd, cmd)
+        let cwd = self.resolve_command_cwd(&arguments)?;
+        command::run_command(&self.cmd_sessions, &cwd, cmd)
     }
 
     fn invoke_start_command_session(&self, arguments: Map<String, Value>) -> Result<String> {
         let cmd = required_string(&arguments, "cmd")?;
-        let result = command::start_command_session(&self.cmd_sessions, &self.workspace_cwd, cmd)?;
+        let cwd = self.resolve_command_cwd(&arguments)?;
+        let result = command::start_command_session(&self.cmd_sessions, &cwd, cmd)?;
         Ok(result.to_string())
+    }
+
+    fn resolve_command_cwd(&self, arguments: &Map<String, Value>) -> Result<PathBuf> {
+        let Some(raw) = arguments.get("cwd").and_then(Value::as_str) else {
+            return Ok(self.workspace_cwd.clone());
+        };
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "." {
+            return Ok(self.workspace_cwd.clone());
+        }
+        if raw.contains('\0') {
+            bail!("invalid cwd");
+        }
+        let candidate = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            self.workspace_cwd.join(raw)
+        };
+        let canonical = candidate.canonicalize().unwrap_or(candidate);
+        if !canonical.starts_with(&self.workspace_cwd) {
+            bail!(
+                "{}",
+                json!({
+                    "code": "cwd_outside_workspace",
+                    "message": "cwd must stay inside the workspace",
+                    "cwd": raw,
+                })
+                .to_string()
+            );
+        }
+        Ok(canonical)
     }
 
     fn invoke_list_command_sessions(&self) -> Result<String> {
@@ -636,9 +674,12 @@ impl BuiltinToolRegistry {
             path: written.clone(),
             status: "patched".to_owned(),
         });
-        let removed = prefix_lines("- ", old_text);
-        let added = prefix_lines("+ ", new_text);
-        Ok(format!("Diff: {written}\n```\n{removed}\n{added}\n```"))
+        Ok(json!({
+            "status": "patched",
+            "path": written,
+            "occurrences_replaced": if replace_all { occurrences } else { 1 },
+        })
+        .to_string())
     }
 
     fn invoke_delete_path(&self, arguments: Map<String, Value>) -> Result<String> {
@@ -694,12 +735,19 @@ impl BuiltinToolRegistry {
         // Guard against truncated output: if the model returned less than 60% of
         // the original length, the rewrite is almost certainly incomplete.
         if original_len > 200 && rewritten.len() < original_len * 6 / 10 {
-            anyhow::bail!(
-                "edit_file_tool: model output ({} chars) is too short compared to the original \
-                 file ({} chars) — refusing to write a likely-truncated result. \
-                 Use patch_file_tool to make targeted edits to large files.",
-                rewritten.len(),
-                original_len
+            bail!(
+                "{}",
+                json!({
+                    "code": "edit_truncated",
+                    "message": "edit_file_tool output is too short — likely truncated",
+                    "diagnostics": {
+                        "path": path,
+                        "original_chars": original_len,
+                        "rewritten_chars": rewritten.len(),
+                    },
+                    "next_step": "Use patch_file_tool for targeted edits to large files instead of rewriting the whole file."
+                })
+                .to_string()
             );
         }
 
@@ -709,92 +757,47 @@ impl BuiltinToolRegistry {
             status: "updated".to_owned(),
         });
         let n = rewritten.lines().count();
-        Ok(format!(
-            "Updated: {written} ({n} lines)\n```\n{}\n```",
-            file_preview(&rewritten)
-        ))
+        Ok(json!({
+            "status": "updated",
+            "path": written,
+            "lines": n,
+        })
+        .to_string())
     }
 
     async fn invoke_create_artifact(&self, arguments: Map<String, Value>) -> Result<String> {
         let instruction = required_string(&arguments, "instruction")?;
         let filename = optional_string(&arguments, "filename");
-        let kind = optional_string(&arguments, "kind");
 
-        self.emit_progress(ToolProgressEvent::Reasoning {
-            summary: "Planning a new artifact before generating file contents.".to_owned(),
-        });
-
-        let mut resolved_kind = kind.map(str::to_owned);
         let final_name = if let Some(f) = filename {
             f.to_owned()
         } else if let Some(f) = exact_filename_from_instruction(instruction) {
             f
-        } else if looks_like_file_content(instruction) {
-            bail!(
-                "create_artifact_tool requires filename when instruction is file content. Pass the exact filename requested by the user."
-            );
         } else {
-            let model = self.require_model()?;
-            if resolved_kind.is_none() {
-                resolved_kind = Some(infer_kind(model, instruction).await?);
-            }
-            infer_filename(
-                model,
-                instruction,
-                resolved_kind.as_deref().unwrap_or("markdown"),
-            )
-            .await?
+            bail!(
+                "{}",
+                json!({
+                    "code": "create_artifact_missing_filename",
+                    "message": "filename is required",
+                    "next_step": "Pass the exact filename or relative path in the `filename` parameter."
+                })
+                .to_string()
+            );
         };
 
-        if filename.is_some() && looks_like_file_content(instruction) {
-            self.emit_progress(ToolProgressEvent::Reasoning {
-                summary: format!("Writing provided content to `{final_name}`."),
-            });
-            let content = sanitize_generated_file_content(instruction);
-            let written = fs::write_file(&self.workspace_cwd, &final_name, &content)?;
-            self.emit_progress(ToolProgressEvent::FileModified {
-                path: written.clone(),
-                status: "created".to_owned(),
-            });
-            let n = content.lines().count();
-            return Ok(format!(
-                "Created: {written} ({n} lines)\n```\n{}\n```",
-                file_preview(&content)
-            ));
-        }
-
-        let model = self.require_model()?;
-        let resolved_kind = match resolved_kind {
-            Some(k) => k,
-            None => infer_kind(model, instruction).await?,
-        };
-        self.emit_progress(ToolProgressEvent::Reasoning {
-            summary: format!("Generating `{final_name}` as {resolved_kind}."),
-        });
-
-        let content_messages = [
-            ChatMessage::system(format!(
-                "You generate file contents only.\nReturn only valid {resolved_kind} content.\nDo not add explanations.\nDo not use code fences."
-            )),
-            ChatMessage::user(instruction),
-        ];
-        let content = sanitize_generated_file_content(
-            &model
-                .complete(&content_messages, &[], 3000, 0.1, None, None)
-                .await?
-                .content
-                .unwrap_or_default(),
-        );
+        let content = sanitize_generated_file_content(instruction);
         let written = fs::write_file(&self.workspace_cwd, &final_name, &content)?;
         self.emit_progress(ToolProgressEvent::FileModified {
             path: written.clone(),
             status: "created".to_owned(),
         });
         let n = content.lines().count();
-        Ok(format!(
-            "Created: {written} ({n} lines)\n```\n{}\n```",
-            file_preview(&content)
-        ))
+        Ok(json!({
+            "status": "created",
+            "path": written,
+            "lines": n,
+        })
+        .to_string())
     }
 }
 
@@ -836,7 +839,15 @@ impl ToolExecutor for BuiltinToolRegistry {
             "delete_path_tool" => self.invoke_delete_path(arguments),
             "edit_file_tool" => self.invoke_edit_file(arguments).await,
             "create_artifact_tool" => self.invoke_create_artifact(arguments).await,
-            _ => bail!("Unknown tool: {name}"),
+            _ => bail!(
+                "{}",
+                json!({
+                    "code": "unknown_tool",
+                    "message": format!("Unknown tool: {name}"),
+                    "available_tools": self.tool_names(),
+                })
+                .to_string()
+            ),
         }
     }
 }
@@ -844,48 +855,6 @@ impl ToolExecutor for BuiltinToolRegistry {
 // ---------------------------------------------------------------------------
 // Filename helpers (create_artifact_tool)
 // ---------------------------------------------------------------------------
-
-fn slugify(text: &str) -> String {
-    let text = text.to_lowercase();
-    let text = text.trim().to_owned();
-    let re1 = Regex::new(r"[^\w\s-]").unwrap();
-    let text = re1.replace_all(&text, "").into_owned();
-    let re2 = Regex::new(r"[\s_-]+").unwrap();
-    let text = re2.replace_all(&text, "-").into_owned();
-    let re3 = Regex::new(r"^-+|-+$").unwrap();
-    let text = re3.replace_all(&text, "").into_owned();
-    if text.is_empty() {
-        "note".to_owned()
-    } else {
-        text
-    }
-}
-
-fn infer_extension(kind: &str) -> &'static str {
-    match kind.to_lowercase().as_str() {
-        "markdown" | "md" => ".md",
-        "json" => ".json",
-        "dart" => ".dart",
-        "python" => ".py",
-        "yaml" | "yml" => ".yml",
-        "text" | "txt" => ".txt",
-        _ => ".txt",
-    }
-}
-
-fn fallback_filename(instruction: &str, kind: &str) -> String {
-    let capped = &instruction[..instruction.len().min(80)];
-    format!("{}{}", slugify(capped), infer_extension(kind))
-}
-
-fn looks_like_file_content(instruction: &str) -> bool {
-    let trimmed = instruction.trim_start();
-    trimmed.starts_with('#')
-        || trimmed.starts_with('{')
-        || trimmed.starts_with('[')
-        || trimmed.starts_with("```")
-        || trimmed.lines().take(5).any(|line| line.starts_with("pub "))
-}
 
 fn sanitize_generated_file_content(text: &str) -> String {
     let mut cleaned = text.to_owned();
@@ -937,71 +906,6 @@ fn sanitize_generated_file_content(text: &str) -> String {
         format!("{cleaned}\n")
     } else {
         cleaned
-    }
-}
-
-async fn infer_kind(model: &dyn ModelClient, instruction: &str) -> Result<String> {
-    let messages = [
-        ChatMessage::system(
-            "Classify the best file kind for the request. Return only one of: markdown, json, dart, python, yaml, text",
-        ),
-        ChatMessage::user(instruction),
-    ];
-    let result = model.complete(&messages, &[], 20, 0.0, None, None).await?;
-    let kind = result.content.unwrap_or_default().trim().to_lowercase();
-    if matches!(
-        kind.as_str(),
-        "markdown" | "json" | "dart" | "python" | "yaml" | "text"
-    ) {
-        Ok(kind)
-    } else {
-        Ok("markdown".to_owned())
-    }
-}
-
-async fn infer_filename(model: &dyn ModelClient, instruction: &str, kind: &str) -> Result<String> {
-    let ext = infer_extension(kind);
-    let messages = [
-        ChatMessage::system(format!(
-            "Generate a short descriptive filename.\n\
-             Rules:\n- return only the filename\n- lowercase\n- kebab-case\n\
-             - must end with {ext}\n- no directories\n- no backticks\n- no explanations\n"
-        )),
-        ChatMessage::user(instruction),
-    ];
-    let result = model.complete(&messages, &[], 40, 0.0, None, None).await?;
-
-    let candidate = result
-        .content
-        .unwrap_or_default()
-        .trim()
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_matches('`')
-        .to_owned();
-    let candidate = candidate.replace('/', "-").replace('\\', "-");
-    let re_ws = Regex::new(r"\s+").unwrap();
-    let candidate = re_ws
-        .replace_all(&candidate.to_lowercase(), "-")
-        .into_owned();
-    let re_invalid = Regex::new(r"[^a-z0-9._-]").unwrap();
-    let candidate = re_invalid.replace_all(&candidate, "").into_owned();
-
-    if candidate.is_empty() {
-        return Ok(fallback_filename(instruction, kind));
-    }
-    if candidate.ends_with(ext) {
-        Ok(candidate)
-    } else if candidate.contains('.') {
-        let base = candidate
-            .rsplit_once('.')
-            .map(|(b, _)| b)
-            .unwrap_or(&candidate);
-        Ok(format!("{base}{ext}"))
-    } else {
-        Ok(format!("{candidate}{ext}"))
     }
 }
 
@@ -1184,11 +1088,15 @@ fn read_file_diagnostic_error(
         "message": message,
         "diagnostics": {
             "path": path,
-            "cwd": cwd.display().to_string(),
             "start_line": start_line,
             "limit": limit,
             "suggested_path": suggestion,
             "path_exists": cwd.join(path).exists(),
+        },
+        "next_step": if suggestion.is_some() {
+            "Use the suggested_path above."
+        } else {
+            "Use list_dir_tool or find_file_tool to discover the correct path."
         }
     })
     .to_string()
@@ -1425,8 +1333,7 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::{
-        BuiltinToolRegistry, exact_filename_from_instruction, fallback_filename, infer_extension,
-        sanitize_generated_file_content, slugify,
+        BuiltinToolRegistry, exact_filename_from_instruction, sanitize_generated_file_content,
     };
     use crate::agent_loop::{AgentLoopOptions, ConversationMessage, ToolExecutor, run_agent_loop};
     use crate::mlx_client::ChatMessage;
@@ -1533,6 +1440,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn command_tool_schemas_expose_optional_cwd() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        let schemas = registry.tool_schemas();
+
+        for name in ["run_command_tool", "start_command_session_tool"] {
+            let schema = schemas
+                .iter()
+                .find(|schema| schema["function"]["name"] == name)
+                .expect("command tool schema");
+            assert!(
+                schema["function"]["parameters"]["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("cwd"),
+                "schema for {name} should expose cwd"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_tool_uses_optional_cwd() {
+        let tempdir = TempDir::new().expect("tempdir");
+        stdfs::create_dir_all(tempdir.path().join("app")).expect("mkdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+
+        let result = registry
+            .invoke(
+                "run_command_tool",
+                json!({"cmd": "pwd", "cwd": "app"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            )
+            .await
+            .expect("run command");
+        let parsed: Value = serde_json::from_str(&result).expect("json result");
+        let expected_cwd = tempdir.path().join("app").canonicalize().unwrap();
+        assert_eq!(
+            parsed["cwd"].as_str().unwrap_or_default(),
+            expected_cwd.to_string_lossy()
+        );
+        assert_eq!(
+            parsed["output"].as_str().unwrap_or_default().trim(),
+            expected_cwd.to_string_lossy()
+        );
+    }
+
     #[tokio::test]
     async fn list_dir_tool_returns_enriched_entries() {
         let tempdir = TempDir::new().expect("tempdir");
@@ -1585,12 +1541,10 @@ mod tests {
         stdfs::create_dir_all(tempdir.path().join("normal")).expect("mkdir");
         stdfs::create_dir_all(tempdir.path().join("`.gemma")).expect("mkdir weird");
 
-        let result = futures::executor::block_on(
-            registry.invoke(
-                "list_dir_tool",
-                json!({"path": "."}).as_object().cloned().unwrap(),
-            ),
-        )
+        let result = futures::executor::block_on(registry.invoke(
+            "list_dir_tool",
+            json!({"path": "."}).as_object().cloned().unwrap(),
+        ))
         .expect("invoke");
         let parsed: Value = serde_json::from_str(&result).expect("json result");
 
@@ -1637,11 +1591,8 @@ mod tests {
                 .expect("limit description");
 
         assert!(description.contains("Read workspace file lines"));
-        assert!(description.contains("full-file coverage"));
-        assert!(limit_description.contains("Maximum lines to return"));
+        assert!(limit_description.contains("Max lines to return"));
         assert!(limit_description.contains("capped at 1200"));
-        assert!(limit_description.contains("broad understanding"));
-        assert!(limit_description.contains("full-file audits"));
     }
 
     #[test]
@@ -1658,16 +1609,15 @@ mod tests {
             .as_str()
             .expect("description");
 
-        assert!(description.contains("Search file contents with ripgrep"));
-        assert!(description.contains("symbols or exact text"));
-        assert!(description.contains("`|` to join alternate terms"));
+        assert!(description.contains("Ripgrep search"));
+        assert!(description.contains("3 lines of context"));
+        assert!(description.contains("follow with read_file_tool"));
 
         let query_description =
             search_schema["function"]["parameters"]["properties"]["query"]["description"]
                 .as_str()
                 .expect("query description");
         assert!(query_description.contains("Ripgrep regex"));
-        assert!(query_description.contains("symbols"));
         assert!(query_description.contains("`|`"));
     }
 
@@ -1689,9 +1639,8 @@ mod tests {
                 .as_str()
                 .expect("include_metadata description");
 
-        assert!(description.contains("Find file paths by glob"));
-        assert!(description.contains("location is unknown"));
-        assert!(metadata_description.contains("chunk sizes or full coverage"));
+        assert!(description.contains("Find files by glob"));
+        assert!(metadata_description.contains("file size and line counts"));
     }
 
     #[test]
@@ -1712,44 +1661,13 @@ mod tests {
                 .as_str()
                 .expect("include_metadata description");
 
-        assert!(description.contains("List workspace file and directory names"));
-        assert!(description.contains("optional metadata"));
-        assert!(description.contains("broad directory audits"));
-        assert!(metadata_description.contains("file kind"));
-        assert!(metadata_description.contains("line count"));
+        assert!(description.contains("List directory contents"));
+        assert!(metadata_description.contains("file size and line counts"));
     }
 
     // -----------------------------------------------------------------------
     // Pure helper tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn slugify_produces_kebab_case() {
-        assert_eq!(slugify("Hello World!"), "hello-world");
-        assert_eq!(slugify("  foo  bar  "), "foo-bar");
-        assert_eq!(slugify("my_file_name"), "my-file-name");
-        assert_eq!(slugify("!!!"), "note");
-        assert_eq!(slugify(""), "note");
-    }
-
-    #[test]
-    fn infer_extension_maps_known_kinds() {
-        assert_eq!(infer_extension("markdown"), ".md");
-        assert_eq!(infer_extension("json"), ".json");
-        assert_eq!(infer_extension("dart"), ".dart");
-        assert_eq!(infer_extension("python"), ".py");
-        assert_eq!(infer_extension("yaml"), ".yml");
-        assert_eq!(infer_extension("text"), ".txt");
-        assert_eq!(infer_extension("unknown_kind"), ".txt");
-    }
-
-    #[test]
-    fn fallback_filename_slugifies_instruction() {
-        assert_eq!(
-            fallback_filename("Write a project README", "markdown"),
-            "write-a-project-readme.md"
-        );
-    }
 
     #[test]
     fn exact_filename_from_instruction_preserves_relative_paths() {
@@ -1890,8 +1808,13 @@ Body text.
             .await
             .expect("invoke");
 
-        assert!(result.starts_with("Updated:"), "result: {result}");
-        assert!(result.contains("notes.txt"), "result: {result}");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("json result");
+        assert_eq!(parsed["status"], "updated", "result: {result}");
+        assert!(
+            parsed["path"].as_str().unwrap().contains("notes.txt"),
+            "result: {result}"
+        );
+        assert_eq!(parsed["lines"], 1);
         assert_eq!(
             stdfs::read_to_string(tempdir.path().join("notes.txt")).unwrap(),
             "updated content"
@@ -1973,14 +1896,13 @@ Body text.
     #[tokio::test]
     async fn create_artifact_tool_creates_file_with_explicit_filename_and_kind() {
         let tempdir = TempDir::new().expect("tempdir");
-        let model = Arc::new(MockModel::new(vec!["# Hello\nThis is the doc."]));
-        let registry =
-            BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+        let content = "# Hello\nThis is the doc.\n";
 
         let result = registry
             .invoke(
                 "create_artifact_tool",
-                json!({"instruction": "Write a short markdown doc", "filename": "doc.md", "kind": "markdown"})
+                json!({"instruction": content, "filename": "doc.md"})
                     .as_object()
                     .cloned()
                     .unwrap(),
@@ -1988,29 +1910,27 @@ Body text.
             .await
             .expect("invoke");
 
-        assert!(result.starts_with("Created:"), "result: {result}");
-        assert!(result.contains("doc.md"), "result: {result}");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("json result");
+        assert_eq!(parsed["status"], "created", "result: {result}");
+        assert!(
+            parsed["path"].as_str().unwrap().contains("doc.md"),
+            "result: {result}"
+        );
         assert_eq!(
             stdfs::read_to_string(tempdir.path().join("doc.md")).unwrap(),
-            "# Hello\nThis is the doc."
+            content
         );
     }
 
     #[tokio::test]
     async fn create_artifact_tool_sanitizes_meta_before_writing() {
         let tempdir = TempDir::new().expect("tempdir");
-        let model = Arc::new(MockModel::new(vec![
-            "markdown",
-            "doc.md",
-            "<|think|>draft<|/think|>\n<|channel>thought\ninternal\n<channel|>\n# Hello\nThis is the doc.\n",
-        ]));
-        let registry =
-            BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
 
         registry
             .invoke(
                 "create_artifact_tool",
-                json!({"instruction": "Write a short markdown doc"})
+                json!({"instruction": "<|think|>draft<|/think|>\n<|channel>thought\ninternal\n<channel|>\n# Hello\nThis is the doc.\n", "filename": "doc.md"})
                     .as_object()
                     .cloned()
                     .unwrap(),
@@ -2025,61 +1945,31 @@ Body text.
     }
 
     #[tokio::test]
-    async fn create_artifact_tool_infers_kind_and_filename() {
-        let tempdir = TempDir::new().expect("tempdir");
-        let model = Arc::new(MockModel::new(vec![
-            "markdown",
-            "my-note.md",
-            "# My Note\nContent here.",
-        ]));
-        let registry =
-            BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
-
-        let result = registry
-            .invoke(
-                "create_artifact_tool",
-                json!({"instruction": "Write a note about the project"})
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-            )
-            .await
-            .expect("invoke");
-
-        assert!(result.starts_with("Created:"), "result: {result}");
-        assert!(result.contains("my-note.md"), "result: {result}");
-    }
-
-    #[tokio::test]
-    async fn create_artifact_tool_uses_fallback_when_model_returns_garbage_filename() {
-        let tempdir = TempDir::new().expect("tempdir");
-        let model = Arc::new(MockModel::new(vec![
-            "text",
-            "!!!invalid!!!",
-            "plain content",
-        ]));
-        let registry =
-            BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
-
-        let result = registry
-            .invoke(
-                "create_artifact_tool",
-                json!({"instruction": "A plain text note"})
-                    .as_object()
-                    .cloned()
-                    .unwrap(),
-            )
-            .await
-            .expect("invoke");
-
-        assert!(result.starts_with("Created:"), "result: {result}");
-        assert!(result.contains("invalid.txt"), "result: {result}");
-    }
-
-    #[tokio::test]
-    async fn create_artifact_tool_fails_without_model() {
+    async fn create_artifact_tool_writes_any_instruction_with_filename() {
+        // The tool no longer second-guesses content — if a filename is given, it writes whatever is in instruction.
         let tempdir = TempDir::new().expect("tempdir");
         let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+
+        let result = registry
+            .invoke(
+                "create_artifact_tool",
+                json!({"instruction": "Write a note about the project", "filename": "note.md"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            )
+            .await
+            .expect("should succeed with explicit filename");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("json result");
+        assert_eq!(parsed["status"], "created", "result: {result}");
+    }
+
+    #[tokio::test]
+    async fn create_artifact_tool_rejects_missing_filename() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
+
         let err = registry
             .invoke(
                 "create_artifact_tool",
@@ -2089,24 +1979,26 @@ Body text.
                     .unwrap(),
             )
             .await
-            .expect_err("should fail");
-        assert!(err.to_string().contains("model"));
+            .expect_err("should fail without filename");
+
+        let parsed: serde_json::Value = serde_json::from_str(&err.to_string()).expect("json error");
+        assert_eq!(
+            parsed["code"], "create_artifact_missing_filename",
+            "error: {err}"
+        );
     }
 
     #[tokio::test]
     async fn create_artifact_tool_uses_exact_filename_from_instruction() {
+        // When no filename arg is given but the content itself contains a recognisable
+        // filename, exact_filename_from_instruction should extract it.
         let tempdir = TempDir::new().expect("tempdir");
-        let model = Arc::new(MockModel::new(vec![
-            "markdown",
-            "# Contributing\nRun `cargo test` before submitting.\n",
-        ]));
-        let registry =
-            BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
 
         let result = registry
             .invoke(
                 "create_artifact_tool",
-                json!({"instruction": "Add a CONTRIBUTING.md file at the repo root."})
+                json!({"instruction": "# CONTRIBUTING.md\n\nRun `cargo test` before submitting.\n"})
                     .as_object()
                     .cloned()
                     .unwrap(),
@@ -2114,8 +2006,12 @@ Body text.
             .await
             .expect("invoke");
 
-        assert!(result.starts_with("Created:"), "result: {result}");
-        assert!(result.contains("CONTRIBUTING.md"), "result: {result}");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("json result");
+        assert_eq!(parsed["status"], "created", "result: {result}");
+        assert!(
+            parsed["path"].as_str().unwrap().contains("CONTRIBUTING.md"),
+            "result: {result}"
+        );
         assert!(tempdir.path().join("CONTRIBUTING.md").exists());
     }
 
@@ -2136,7 +2032,8 @@ Body text.
             .await
             .expect("invoke");
 
-        assert!(result.starts_with("Created:"), "result: {result}");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("json result");
+        assert_eq!(parsed["status"], "created", "result: {result}");
         assert_eq!(
             stdfs::read_to_string(tempdir.path().join("plan.md")).unwrap(),
             content
@@ -2146,9 +2043,7 @@ Body text.
     #[tokio::test]
     async fn create_artifact_tool_rejects_content_only_instruction_without_filename() {
         let tempdir = TempDir::new().expect("tempdir");
-        let model = Arc::new(MockModel::new(vec!["markdown"]));
-        let registry =
-            BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
 
         let err = registry
             .invoke(
@@ -2159,10 +2054,9 @@ Body text.
                     .unwrap(),
             )
             .await
-            .expect_err("content-only instruction should require filename");
+            .expect_err("content without resolvable filename should fail");
 
-        assert!(err.to_string().contains("requires filename"));
-        assert!(!tempdir.path().join("contributing-guide.md").exists());
+        assert!(err.to_string().contains("filename"), "error: {err}");
     }
 
     // -----------------------------------------------------------------------
@@ -2272,19 +2166,13 @@ Body text.
     #[tokio::test]
     async fn real_registry_can_create_artifact_through_agent_loop() {
         let tempdir = TempDir::new().expect("tempdir");
-        let model = Arc::new(MockModel::new(vec![
-            "markdown",
-            "summary.md",
-            "# Summary\nCreated by the tool.\n",
-        ]));
-        let registry =
-            BuiltinToolRegistry::new_with_model(tempdir.path(), model).expect("registry");
+        let registry = BuiltinToolRegistry::new(tempdir.path()).expect("registry");
         let schemas = registry.tool_schemas();
         let loop_model = MockModel::with_results(vec![
             tool_call_result(
                 "c1",
                 "create_artifact_tool",
-                json!({"instruction": "Write a short markdown summary file."}),
+                json!({"instruction": "# Summary\nCreated by the tool.\n", "filename": "summary.md"}),
             ),
             text_result("Created summary.md."),
         ]);
@@ -2307,8 +2195,13 @@ Body text.
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].name, "create_artifact_tool");
         let tool_result = &result.tool_results[0].result;
-        assert!(tool_result.starts_with("Created:"), "result: {tool_result}");
-        assert!(tool_result.contains("summary.md"), "result: {tool_result}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(tool_result).expect("json tool result");
+        assert_eq!(parsed["status"], "created", "result: {tool_result}");
+        assert!(
+            parsed["path"].as_str().unwrap().contains("summary.md"),
+            "result: {tool_result}"
+        );
         assert_eq!(
             stdfs::read_to_string(tempdir.path().join("summary.md")).unwrap(),
             "# Summary\nCreated by the tool.\n"

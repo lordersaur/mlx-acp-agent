@@ -89,7 +89,12 @@ pub fn search_code(
         if resolved.exists() {
             resolved.display().to_string()
         } else {
-            return Ok(format!("path not found: {p}"));
+            return Ok(json!({
+                "code": "path_not_found",
+                "message": format!("path not found: {p}"),
+                "next_step": "Use find_file_tool or list_dir_tool to locate the correct path."
+            })
+            .to_string());
         }
     } else {
         base.display().to_string()
@@ -154,14 +159,69 @@ pub fn search_code(
             })
             .to_string());
         }
-        return Ok(format!("search failed\nstderr:\n{stderr}"));
+        return Ok(json!({
+            "code": "search_failed",
+            "message": "ripgrep exited with an unexpected error",
+            "diagnostics": { "exit_code": code, "stderr": stderr },
+            "next_step": "Check the query syntax or try a simpler pattern."
+        })
+        .to_string());
     }
 
     if stdout.is_empty() {
-        return Ok("No matches found.".to_owned());
+        return Ok(json!({
+            "status": "no_matches",
+            "query": query,
+            "glob": glob,
+            "path": path,
+            "next_step": "Check spelling, try a broader pattern, or omit the path to search the whole workspace."
+        })
+        .to_string());
     }
 
-    Ok(stdout)
+    // Parse rg numbered output lines (format: "NNN:" for matches, "NNN-" for context).
+    // Returns the line number if the line starts with digits followed by ':' or '-'.
+    fn parse_rg_line_no(line: &str) -> Option<u64> {
+        let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let rest = &line[digits.len()..];
+        if rest.starts_with(':') || rest.starts_with('-') {
+            digits.parse().ok()
+        } else {
+            None
+        }
+    }
+
+    let _last_match_line = stdout
+        .lines()
+        .filter_map(|line| {
+            let n = parse_rg_line_no(line)?;
+            line[n.to_string().len()..].starts_with(':').then_some(n)
+        })
+        .last();
+    let last_shown_line = stdout.lines().filter_map(parse_rg_line_no).last();
+
+    // Find the first numbered line in the last match group (after the final "--" separator).
+    let last_group_start = stdout
+        .lines()
+        .collect::<Vec<_>>()
+        .rsplit(|l| l.trim() == "--")
+        .next()
+        .and_then(|group| group.iter().find_map(|l| parse_rg_line_no(l)));
+
+    let note = match (last_group_start, last_shown_line) {
+        (Some(group_start), Some(last_line)) => format!(
+            "\n[INCOMPLETE — last match group shows lines {group_start}–{last_line}; lines after {last_line} are not shown. Call read_file_tool to read the full definition before answering.]"
+        ),
+        (_, Some(last_line)) => format!(
+            "\n[INCOMPLETE — lines after {last_line} are not shown. Call read_file_tool to read the full definition before answering.]"
+        ),
+        _ => String::new(),
+    };
+
+    Ok(format!("{stdout}{note}"))
 }
 
 pub fn find_files(cwd: &Path, pattern: &str, include_metadata: bool) -> Result<String> {
@@ -477,7 +537,9 @@ mod tests {
         assert!(matches.contains("src/lib.rs:1:fn alpha() {}"));
 
         let none = search_code(tempdir.path(), "gamma", Some("*.rs"), None).expect("search");
-        assert_eq!(none, "No matches found.");
+        let parsed: serde_json::Value = serde_json::from_str(&none).expect("json no-match");
+        assert_eq!(parsed["status"], "no_matches");
+        assert_eq!(parsed["query"], "gamma");
     }
 
     #[test]

@@ -31,6 +31,9 @@ use crate::tools::{BuiltinToolRegistry, ToolProgressEvent, ToolProgressSink};
 
 const MAX_HISTORY_TURNS: usize = 10;
 const MAX_TURN_CHARS: usize = 3500;
+const MAX_STORED_HISTORY_CHARS: usize = 24_000;
+const MAX_PROMPT_HISTORY_CHARS: usize = 24_000;
+const MAX_CONTEXT_SUMMARY_CHARS: usize = 4_000;
 const PROTOCOL_VERSION: u64 = 1;
 
 const TOOL_KINDS: &[(&str, &str)] = &[
@@ -404,6 +407,7 @@ impl AcpServer {
                     cwd: cwd.clone(),
                     mode_id: "agent".to_owned(),
                     turns: Vec::new(),
+                    context_summary: None,
                     active_command_sessions: HashMap::new(),
                     active_tool_calls: HashMap::new(),
                     tool_event_counter: 0,
@@ -459,6 +463,7 @@ impl AcpServer {
                     cwd: ".".to_owned(),
                     mode_id: "agent".to_owned(),
                     turns: Vec::new(),
+                    context_summary: None,
                     active_command_sessions: HashMap::new(),
                     active_tool_calls: HashMap::new(),
                     tool_event_counter: 0,
@@ -477,19 +482,26 @@ impl AcpServer {
         }
 
         // Snapshot session state and clone registry (cheap Arc clone)
-        let (mode_id, turns, cwd, registry) = {
+        let (mode_id, turns, cwd, context_summary, registry) = {
             let mut map = self.sessions.lock().unwrap();
             let entry = map.get_mut(&session_id).unwrap();
             (
                 entry.state.mode_id.clone(),
                 entry.state.turns.clone(),
                 entry.state.cwd.clone(),
+                entry.state.context_summary.clone(),
                 entry.registry.clone(),
             )
         };
 
         // Build conversation messages
-        let messages = build_messages(&mode_id, &cwd, &turns, &user_text);
+        let messages = build_messages(
+            &mode_id,
+            &cwd,
+            context_summary.as_deref(),
+            &turns,
+            &user_text,
+        );
 
         let tool_schemas = registry.tool_schemas();
 
@@ -619,8 +631,9 @@ impl AcpServer {
 
         if let Some(result) = loop_result {
             let _reasoning_text = active_reasoning.lock().unwrap().take();
-            // Update session state
-            {
+
+            // Push new turns, drain overflowing ones, grab model ref — all inside the lock.
+            let (evicted, model_for_summary) = {
                 let mut map = self.sessions.lock().unwrap();
                 if let Some(entry) = map.get_mut(&session_id) {
                     entry
@@ -632,20 +645,106 @@ impl AcpServer {
                         &result.answer,
                         &result.tool_results,
                     ));
-                    // Trim in-memory history
-                    if entry.state.turns.len() > MAX_HISTORY_TURNS * 2 {
-                        let drain_to = entry.state.turns.len() - MAX_HISTORY_TURNS * 2;
-                        entry.state.turns.drain(..drain_to);
-                    }
                     update_command_sessions(&mut entry.state, &result.tool_results);
+
+                    let keep_count = history_keep_count(
+                        &entry.state.turns,
+                        MAX_HISTORY_TURNS * 2,
+                        MAX_STORED_HISTORY_CHARS,
+                    );
+                    if keep_count < entry.state.turns.len() {
+                        let drain_to = entry.state.turns.len() - keep_count;
+                        let evicted: Vec<_> = entry.state.turns.drain(..drain_to).collect();
+                        let model = entry.registry.model_client();
+                        (evicted, model)
+                    } else {
+                        (vec![], None)
+                    }
+                } else {
+                    (vec![], None)
+                }
+            }; // lock released — safe to await now
+
+            // Summarize evicted turns outside the lock so we don't block other requests.
+            if !evicted.is_empty() {
+                if let Some(model) = model_for_summary {
+                    if let Some(new_summary) =
+                        summarize_evicted_turns(model.as_ref(), &evicted).await
+                    {
+                        let summary_to_compact = {
+                            let mut map = self.sessions.lock().unwrap();
+                            if let Some(entry) = map.get_mut(&session_id) {
+                                let merged = match entry.state.context_summary.take() {
+                                    Some(prev) => format!("{prev}\n\n{new_summary}"),
+                                    None => new_summary,
+                                };
+                                if merged.chars().count() > MAX_CONTEXT_SUMMARY_CHARS {
+                                    Some((merged, entry.registry.model_client()))
+                                } else {
+                                    entry.state.context_summary = Some(merged);
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some((summary, model_for_compaction)) = summary_to_compact {
+                            let compacted = if let Some(model_for_compaction) = model_for_compaction
+                            {
+                                compact_context_summary(model_for_compaction.as_ref(), &summary)
+                                    .await
+                                    .unwrap_or_else(|| {
+                                        truncate_chars(&summary, MAX_CONTEXT_SUMMARY_CHARS)
+                                    })
+                            } else {
+                                truncate_chars(&summary, MAX_CONTEXT_SUMMARY_CHARS)
+                            };
+
+                            let mut map = self.sessions.lock().unwrap();
+                            if let Some(entry) = map.get_mut(&session_id) {
+                                entry.state.context_summary = Some(compacted);
+                            }
+                        }
+                    }
                 }
             }
+
+            let summary_to_compact = {
+                let mut map = self.sessions.lock().unwrap();
+                if let Some(entry) = map.get_mut(&session_id) {
+                    if let Some(summary) = entry.state.context_summary.take() {
+                        if summary.chars().count() > MAX_CONTEXT_SUMMARY_CHARS {
+                            Some((summary, entry.registry.model_client()))
+                        } else {
+                            entry.state.context_summary = Some(summary);
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some((summary, model_for_compaction)) = summary_to_compact {
+                let compacted = if let Some(model_for_compaction) = model_for_compaction {
+                    compact_context_summary(model_for_compaction.as_ref(), &summary)
+                        .await
+                        .unwrap_or_else(|| truncate_chars(&summary, MAX_CONTEXT_SUMMARY_CHARS))
+                } else {
+                    truncate_chars(&summary, MAX_CONTEXT_SUMMARY_CHARS)
+                };
+
+                let mut map = self.sessions.lock().unwrap();
+                if let Some(entry) = map.get_mut(&session_id) {
+                    entry.state.context_summary = Some(compacted);
+                }
+            }
+
             if !result.answer_streamed {
-                self.send_message_with_id(
-                    &session_id,
-                    &result.answer,
-                    Some(&response_message_id),
-                );
+                self.send_message_with_id(&session_id, &result.answer, Some(&response_message_id));
             }
         } else {
             // Interrupted or cancelled. The session remains in memory only.
@@ -956,7 +1055,7 @@ impl ProgressRegistry {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
-        let cwd = self.inner.workspace_cwd().to_string_lossy().into_owned();
+        let cwd = command_cwd_for_terminal(self.inner.workspace_cwd(), arguments);
         let (terminal_command, terminal_args) = terminal_command_and_args(&cmd);
 
         let create_result = self
@@ -1025,21 +1124,15 @@ impl ProgressRegistry {
         let cmd_bg = cmd.clone();
 
         tokio::spawn(async move {
-            let exit_result: Result<Value> = match tokio::time::timeout(
-                std::time::Duration::from_secs(300),
-                caller.call(
+            let exit_result: Result<Value> = caller
+                .call(
                     "terminal/wait_for_exit",
                     json!({
                         "sessionId": acp_session_id,
                         "terminalId": terminal_id_bg,
                     }),
-                ),
-            )
-            .await
-            {
-                Ok(inner) => inner,
-                Err(_) => Err(anyhow::anyhow!("timeout")),
-            };
+                )
+                .await;
 
             let exit_code = exit_result
                 .ok()
@@ -1163,7 +1256,7 @@ impl ProgressRegistry {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
-        let cwd = self.inner.workspace_cwd().to_string_lossy().into_owned();
+        let cwd = command_cwd_for_terminal(self.inner.workspace_cwd(), arguments);
         let (terminal_command, terminal_args) = terminal_command_and_args(&cmd);
 
         // Create the ACP terminal — Zed will display it live in the panel.
@@ -1219,25 +1312,43 @@ impl ProgressRegistry {
             },
         }));
 
-        // Wait for the command to finish. The ACP schema has no timeout field — Zed waits
-        // until the process exits. We add a client-side 5-minute timeout so the agent
-        // doesn't hang forever if the command never terminates.
-        let exit_result: Result<Value> = match tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            self.caller.call(
-                "terminal/wait_for_exit",
-                json!({
-                    "sessionId": self.session_id,
-                    "terminalId": terminal_id,
-                }),
-            ),
-        )
-        .await
-        {
-            Ok(inner) => inner,
-            Err(_) => Err(anyhow::anyhow!(
-                "terminal/wait_for_exit timed out after 300s"
-            )),
+        // Wait for the command to finish while polling live output. The live
+        // terminal remains visible in Zed, but the tool only resolves when the
+        // process exits or the timeout fires.
+        let wait_for_exit = self.caller.call(
+            "terminal/wait_for_exit",
+            json!({
+                "sessionId": self.session_id,
+                "terminalId": terminal_id,
+            }),
+        );
+        tokio::pin!(wait_for_exit);
+
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(300));
+        tokio::pin!(timeout);
+        let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(300));
+        let mut timed_out = false;
+
+        let exit_result: Result<Value> = loop {
+            tokio::select! {
+                result = &mut wait_for_exit => break result,
+                _ = &mut timeout => {
+                    timed_out = true;
+                    break Err(anyhow::anyhow!("terminal/wait_for_exit timed out after 300s"));
+                }
+                _ = poll_interval.tick() => {
+                    let _ = self
+                        .caller
+                        .call(
+                            "terminal/output",
+                            json!({
+                                "sessionId": self.session_id,
+                                "terminalId": terminal_id,
+                            }),
+                        )
+                        .await;
+                }
+            }
         };
 
         let output_result = self
@@ -1270,6 +1381,63 @@ impl ProgressRegistry {
             .map(extract_terminal_output)
             .unwrap_or_default();
 
+        if timed_out {
+            self.caller
+                .call(
+                    "terminal/kill",
+                    json!({
+                        "sessionId": self.session_id,
+                        "terminalId": terminal_id,
+                    }),
+                )
+                .await
+                .ok();
+
+            let timeout_output = json!({
+                "cmd": cmd,
+                "cwd": cwd,
+                "running": false,
+                "exit_code": null,
+                "status": "error",
+                "error": {
+                    "code": "timeout",
+                    "message": "live terminal command did not finish before the timeout",
+                },
+                "output": output,
+            })
+            .to_string();
+            let update_text = render_tool_finished("run_command_tool", arguments, &timeout_output)
+                .unwrap_or_else(|| format!("`{cmd}` timed out."));
+
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": self.session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tool_call_id,
+                        "status": "error",
+                        "content": [{"type": "content", "content": {"type": "text", "text": update_text}}],
+                        "rawOutput": parse_tool_output(&timeout_output),
+                    },
+                },
+            }));
+
+            self.caller
+                .call(
+                    "terminal/release",
+                    json!({
+                        "sessionId": self.session_id,
+                        "terminalId": terminal_id,
+                    }),
+                )
+                .await
+                .ok();
+
+            return Ok(timeout_output);
+        }
+
         // If ACP terminal interaction failed entirely, fall back to the normal
         // command implementation instead of fabricating a failure.
         if exit_code.is_none() && output.is_empty() {
@@ -1292,6 +1460,8 @@ impl ProgressRegistry {
         let exit_code = exit_code.unwrap_or(0);
         let formatted_output = format!(
             "$ {cmd}
+
+cwd: {cwd}
 
 exit_code: {exit_code}
 
@@ -1388,6 +1558,7 @@ impl ToolExecutor for ProgressRegistry {
         if name == "run_command_tool" && self.has_terminal {
             return self.invoke_via_terminal(tool_call_id, &arguments).await;
         }
+
         if name == "start_command_session_tool" && self.has_terminal {
             return self
                 .invoke_start_session_with_terminal(tool_call_id, &arguments)
@@ -1524,27 +1695,94 @@ fn extract_prompt_text(params: &Value) -> String {
     parts.join("\n").trim().to_owned()
 }
 
+async fn summarize_evicted_turns(
+    model: &dyn ModelClient,
+    evicted: &[crate::session_store::TurnRecord],
+) -> Option<String> {
+    use crate::mlx_client::ChatMessage;
+    let log = crate::session_store::format_turns_for_summary(evicted);
+    if log.trim().is_empty() {
+        return None;
+    }
+    let messages = [
+        ChatMessage::system(
+            "You are a conversation summarizer. \
+            Summarize the provided conversation log into 2-5 concise factual sentences. \
+            Focus on: what was accomplished, technologies and languages used, files or directories \
+            created or modified, and any tasks left incomplete. \
+            Be specific — include filenames, tech stack, and key decisions. No opinions or recommendations.",
+        ),
+        ChatMessage::user(format!("Summarize this conversation log:\n\n{log}")),
+    ];
+    model
+        .complete(&messages, &[], 500, 0.0, None, None)
+        .await
+        .ok()
+        .and_then(|r| r.content)
+        .map(|c| {
+            // Strip any thinking tokens the model may have emitted.
+            let (_thoughts, cleaned) = extract_thought_blocks(&c);
+            cleaned.trim().to_owned()
+        })
+        .filter(|c| !c.is_empty())
+}
+
+async fn compact_context_summary(model: &dyn ModelClient, summary: &str) -> Option<String> {
+    use crate::mlx_client::ChatMessage;
+    if summary.trim().is_empty() {
+        return None;
+    }
+    let messages = [
+        ChatMessage::system(
+            "You compress rolling conversation summaries. \
+            Rewrite the provided summary into 2-4 concise factual sentences. \
+            Preserve filenames, commands, symbols, decisions, and unresolved work. \
+            Remove duplicates and low-value detail. Return only the compressed summary.",
+        ),
+        ChatMessage::user(format!("Compress this summary:\n\n{summary}")),
+    ];
+    model
+        .complete(&messages, &[], 300, 0.0, None, None)
+        .await
+        .ok()
+        .and_then(|r| r.content)
+        .map(|c| {
+            let (_thoughts, cleaned) = extract_thought_blocks(&c);
+            cleaned.trim().to_owned()
+        })
+        .filter(|c| !c.is_empty())
+}
+
 fn build_messages(
     mode_id: &str,
     cwd: &str,
+    context_summary: Option<&str>,
     turns: &[crate::session_store::TurnRecord],
     user_text: &str,
 ) -> Vec<ConversationMessage> {
     let mut messages = Vec::new();
-    let mut system_parts: Vec<String> = Vec::new();
+    let current_user_prompt = build_current_user_prompt(user_text);
+    let normalized_summary = context_summary
+        .map(normalize_context_summary)
+        .filter(|summary| !summary.trim().is_empty());
+    let summary_context = normalized_summary
+        .as_ref()
+        .map(|summary| {
+            format!("\n\nBackground context from earlier turns, not a current task:\n{summary}")
+        })
+        .unwrap_or_default();
+    let system_message = format!(
+        "{}\n\n{}{}",
+        SYSTEM_PROMPT,
+        environment_context(cwd, mode_id),
+        summary_context
+    );
+    let base_chars = system_message.chars().count() + current_user_prompt.chars().count();
+    let history_budget = MAX_PROMPT_HISTORY_CHARS.saturating_sub(base_chars);
 
-    system_parts.push(SYSTEM_PROMPT.to_owned());
+    messages.push(ConversationMessage::new("system", system_message));
 
-    system_parts.push(environment_context(cwd, mode_id));
-
-    if !system_parts.is_empty() {
-        messages.push(ConversationMessage::new(
-            "system",
-            system_parts.join("\n\n"),
-        ));
-    }
-
-    let recent = &turns[turns.len().saturating_sub(MAX_HISTORY_TURNS)..];
+    let recent = select_recent_turns(turns, MAX_HISTORY_TURNS, history_budget);
     for turn in recent {
         if turn.role == "system" {
             continue;
@@ -1556,10 +1794,7 @@ fn build_messages(
         ));
     }
 
-    messages.push(ConversationMessage::new(
-        "user",
-        build_current_user_prompt(user_text),
-    ));
+    messages.push(ConversationMessage::new("user", current_user_prompt));
     messages
 }
 
@@ -1573,10 +1808,13 @@ Task:
 
 Reminder:
 - Use tools only when needed.
-- If the task names a specific file, read it directly — do not search or list first.
+- If the task asks to research, compare, recommend, or choose a stack/approach, provide the recommendation and ask before creating files, installing dependencies, or scaffolding.
+- If the user says to continue, proceed, do it, ok, or stop asking for confirmation, keep working until blocked.
+- Before installing a missing runtime or package manager dependency, inspect OS/package managers first. Do not try sudo unless the user explicitly requested sudo.
+- If the task names a specific file, read it directly.
+- For project commands, pass `cwd`; each command starts fresh.
 - Follow the requested output format.
-- Honor explicit constraints and delimiters from the user message exactly.
-- If the user gives examples, match their structure unless they conflict with a stronger instruction."
+- Honor explicit constraints, delimiters, and examples from the user message exactly."
     )
 }
 
@@ -1592,11 +1830,91 @@ Environment context:
 }
 
 fn truncate(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
+    truncate_chars(text, limit)
+}
+
+fn normalize_context_summary(summary: &str) -> String {
+    truncate_chars(summary, MAX_CONTEXT_SUMMARY_CHARS)
+}
+
+fn select_recent_turns<'a>(
+    turns: &'a [crate::session_store::TurnRecord],
+    max_turns: usize,
+    max_chars: usize,
+) -> Vec<&'a crate::session_store::TurnRecord> {
+    let mut selected: Vec<&crate::session_store::TurnRecord> = Vec::new();
+    let mut used_chars = 0usize;
+
+    for turn in turns.iter().rev() {
+        if turn.role == "system" {
+            continue;
+        }
+
+        let turn_chars = estimate_turn_chars(turn);
+        let would_exceed_char_budget = used_chars + turn_chars > max_chars;
+        let would_exceed_turn_budget = selected.len() >= max_turns;
+
+        if (would_exceed_char_budget || would_exceed_turn_budget) && !selected.is_empty() {
+            break;
+        }
+
+        selected.push(turn);
+        used_chars += turn_chars;
+
+        if selected.len() >= max_turns || used_chars >= max_chars {
+            break;
+        }
+    }
+
+    selected.reverse();
+    selected
+}
+
+fn estimate_turn_chars(turn: &crate::session_store::TurnRecord) -> usize {
+    turn.role.chars().count() + turn.content.chars().count().min(MAX_TURN_CHARS) + 32
+}
+
+fn history_keep_count(
+    turns: &[crate::session_store::TurnRecord],
+    max_turns: usize,
+    max_chars: usize,
+) -> usize {
+    let mut keep_count = 0usize;
+    let mut used_chars = 0usize;
+
+    for turn in turns.iter().rev() {
+        let turn_chars = estimate_turn_chars(turn);
+        let would_exceed_char_budget = used_chars + turn_chars > max_chars;
+        let would_exceed_turn_budget = keep_count >= max_turns;
+
+        if (would_exceed_char_budget || would_exceed_turn_budget) && keep_count > 0 {
+            break;
+        }
+
+        keep_count += 1;
+        used_chars += turn_chars;
+
+        if keep_count >= max_turns && used_chars >= max_chars {
+            break;
+        }
+    }
+
+    keep_count
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= limit {
         return text.to_owned();
     }
-    let omitted = text.len() - limit;
-    format!("{}\n... [truncated {omitted} chars]", &text[..limit])
+
+    let end = text
+        .char_indices()
+        .nth(limit)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    let omitted = total_chars.saturating_sub(limit);
+    format!("{}\n... [truncated {omitted} chars]", &text[..end])
 }
 
 fn tool_kind(name: &str) -> &'static str {
@@ -1784,9 +2102,9 @@ enum ToolVisibleStyle {
 
 fn tool_visible_style(name: &str) -> ToolVisibleStyle {
     match name {
-        "read_file_tool" | "search_code_tool"
-        | "find_file_tool"
-        | "list_dir_tool" => ToolVisibleStyle::Json,
+        "read_file_tool" | "search_code_tool" | "find_file_tool" | "list_dir_tool" => {
+            ToolVisibleStyle::Json
+        }
         "patch_file_tool" | "edit_file_tool" | "create_artifact_tool" | "delete_path_tool" => {
             ToolVisibleStyle::Diff
         }
@@ -1806,6 +2124,7 @@ fn render_tool_json_document(
     is_error: bool,
 ) -> String {
     let output_key = if is_error { "error" } else { "output" };
+    let parsed_output = parse_tool_output(output);
     let mut document = Map::new();
     document.insert("tool".to_owned(), Value::String(name.to_owned()));
     document.insert("input".to_owned(), Value::Object(args.clone()));
@@ -1813,7 +2132,7 @@ fn render_tool_json_document(
         "status".to_owned(),
         Value::String(if is_error { "error" } else { "completed" }.to_owned()),
     );
-    document.insert(output_key.to_owned(), parse_tool_output(output));
+    document.insert(output_key.to_owned(), parsed_output);
 
     format!(
         "```json\n{}\n```",
@@ -1822,7 +2141,10 @@ fn render_tool_json_document(
 }
 
 fn render_diff_output(output: &str) -> String {
-    if output.starts_with("Diff:")
+    if output.starts_with('{') {
+        // JSON status response — pass through as-is
+        output.to_owned()
+    } else if output.starts_with("Diff:")
         || output.starts_with("Updated:")
         || output.starts_with("Created:")
     {
@@ -1858,6 +2180,26 @@ fn terminal_command_and_args(cmd: &str) -> (String, Vec<String>) {
             (command, args)
         }
         _ => ("sh".to_owned(), vec!["-c".to_owned(), cmd.to_owned()]),
+    }
+}
+
+fn command_cwd_for_terminal(workspace_cwd: &std::path::Path, args: &Map<String, Value>) -> String {
+    let Some(raw) = args.get("cwd").and_then(Value::as_str).map(str::trim) else {
+        return workspace_cwd.to_string_lossy().into_owned();
+    };
+    if raw.is_empty() || raw == "." {
+        return workspace_cwd.to_string_lossy().into_owned();
+    }
+    let candidate = if std::path::Path::new(raw).is_absolute() {
+        std::path::PathBuf::from(raw)
+    } else {
+        workspace_cwd.join(raw)
+    };
+    let canonical = candidate.canonicalize().unwrap_or(candidate);
+    if canonical.starts_with(workspace_cwd) {
+        canonical.to_string_lossy().into_owned()
+    } else {
+        workspace_cwd.to_string_lossy().into_owned()
     }
 }
 
@@ -2080,13 +2422,13 @@ mod tests {
     #[test]
     fn render_tool_finished_edit_uses_diff_style() {
         let args = json!({"path": "notes.txt"}).as_object().cloned().unwrap();
-        let output = "Diff: /tmp/notes.txt\n```\n- old\n+ new\n```";
+        let output = r#"{"status":"updated","path":"/tmp/notes.txt","lines":3}"#;
         let rendered = render_tool_finished("edit_file_tool", &args, output).expect("rendered");
-        assert!(rendered.starts_with("Diff: /tmp/notes.txt"), "{rendered}");
+        // JSON output is passed through as-is in diff style
+        assert!(rendered.contains("updated"), "{rendered}");
+        assert!(rendered.contains("notes.txt"), "{rendered}");
         assert!(!rendered.contains("**Tool Call:"), "{rendered}");
         assert!(!rendered.contains("Input:\n```json"), "{rendered}");
-        assert!(rendered.contains("- old"), "{rendered}");
-        assert!(rendered.contains("+ new"), "{rendered}");
     }
 
     #[test]
@@ -2205,6 +2547,7 @@ mod tests {
         let messages = build_messages(
             "agent",
             "/Users/daxel/mlx-acp-agent",
+            None,
             &[],
             "read CLAUDE.md explain it to me",
         );
@@ -2229,10 +2572,67 @@ mod tests {
     }
 
     #[test]
+    fn build_messages_current_prompt_mentions_runtime_blocker() {
+        let messages = build_messages(
+            "agent",
+            "/Users/daxel/mlx-acp-agent",
+            None,
+            &[],
+            "read CLAUDE.md explain it to me",
+        );
+
+        let user = messages.last().expect("current user message");
+        let user_content = user.content.as_str();
+        assert!(
+            user_content.contains("research, compare, recommend, or choose a stack/approach"),
+            "{user_content}"
+        );
+        assert!(
+            user_content
+                .contains("ask before creating files, installing dependencies, or scaffolding"),
+            "{user_content}"
+        );
+        assert!(
+            user_content.contains("For project commands, pass `cwd`"),
+            "{user_content}"
+        );
+        assert!(
+            user_content.contains("stop asking for confirmation"),
+            "{user_content}"
+        );
+        assert!(user_content.contains("inspect OS/package managers first"));
+    }
+
+    #[test]
+    fn build_messages_inlines_context_summary_into_first_system_message() {
+        let messages = build_messages(
+            "agent",
+            "/Users/daxel/mlx-acp-agent",
+            Some("Created ECommerceApp and Product.cs."),
+            &[],
+            "continue",
+        );
+
+        let system_messages: Vec<_> = messages.iter().filter(|m| m.role == "system").collect();
+        assert_eq!(system_messages.len(), 1);
+        assert!(
+            system_messages[0]
+                .content
+                .contains("Background context from earlier turns, not a current task:")
+        );
+        assert!(
+            system_messages[0]
+                .content
+                .contains("Created ECommerceApp and Product.cs.")
+        );
+    }
+
+    #[test]
     fn build_messages_keeps_recent_history() {
         let messages = build_messages(
             "agent",
             "/Users/daxel/mlx-acp-agent",
+            None,
             &[crate::session_store::build_turn_record(
                 "user",
                 "hello",
@@ -2245,6 +2645,33 @@ mod tests {
             messages
                 .iter()
                 .any(|m| m.role == "user" && m.content.contains("hello"))
+        );
+    }
+
+    #[test]
+    fn build_messages_limits_history_by_total_size() {
+        let large_turn = "x".repeat(super::MAX_TURN_CHARS);
+        let mut turns = Vec::new();
+        for i in 0..10 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            turns.push(crate::session_store::build_turn_record(
+                role,
+                &large_turn,
+                &[],
+            ));
+        }
+
+        let messages = build_messages(
+            "agent",
+            "/Users/daxel/mlx-acp-agent",
+            None,
+            &turns,
+            "read claude.md",
+        );
+
+        assert!(
+            messages.len() < 12,
+            "messages included all history turns despite the size budget"
         );
     }
 
@@ -2301,15 +2728,10 @@ mod tests {
     #[tokio::test]
     async fn progress_registry_emits_create_artifact_reasoning_and_tool_output() {
         let tempdir = TempDir::new().expect("tempdir");
-        let model = Arc::new(MockModel::new(vec![
-            "markdown",
-            "summary.md",
-            "# Summary\nCreated by the tool.\n",
-        ]));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (caller_tx, _caller_rx) = mpsc::unbounded_channel();
         let progress_registry = ProgressRegistry {
-            inner: BuiltinToolRegistry::new_with_model(tempdir.path(), model)
+            inner: BuiltinToolRegistry::new(tempdir.path())
                 .expect("registry")
                 .with_progress_sink(Arc::new(AcpProgressSink {
                     tx: tx.clone(),
@@ -2328,7 +2750,7 @@ mod tests {
         progress_registry
             .invoke(
                 "create_artifact_tool",
-                json!({"instruction": "Write a short markdown summary file."})
+                json!({"instruction": "# Summary\nCreated by the tool.\n", "filename": "summary.md"})
                     .as_object()
                     .cloned()
                     .unwrap(),
@@ -2337,22 +2759,6 @@ mod tests {
             .expect("invoke");
 
         let updates = drain_updates(&mut rx);
-        let thoughts = thought_texts(&updates);
-        assert!(
-            thoughts
-                .iter()
-                .any(|t| t.contains("Planning a new artifact before generating file contents."))
-        );
-        assert!(
-            thoughts
-                .iter()
-                .any(|t| t.contains("Generating `summary.md` as markdown."))
-        );
-        assert!(
-            thoughts
-                .iter()
-                .any(|t| t.contains("Created `") && t.contains("summary.md`."))
-        );
 
         let update = updates
             .iter()
@@ -2364,19 +2770,23 @@ mod tests {
                     == Some("tool_call_update")
             })
             .expect("tool_call_update");
-        let raw_output = update["params"]["update"]["rawOutput"]
-            .as_str()
-            .expect("rawOutput should be a string");
-        assert!(raw_output.contains("summary.md"), "rawOutput: {raw_output}");
+        let raw_output_parsed = update["params"]["update"]["rawOutput"].clone();
+        assert_eq!(
+            raw_output_parsed["status"], "created",
+            "rawOutput: {raw_output_parsed}"
+        );
+        assert!(
+            raw_output_parsed["path"]
+                .as_str()
+                .unwrap()
+                .contains("summary.md"),
+            "rawOutput: {raw_output_parsed}"
+        );
         let update_text = update["params"]["update"]["content"][0]["content"]["text"]
             .as_str()
             .expect("update text");
         assert!(
             update_text.contains("summary.md"),
-            "update_text: {update_text}"
-        );
-        assert!(
-            update_text.contains("# Summary"),
             "update_text: {update_text}"
         );
     }
@@ -2446,16 +2856,18 @@ mod tests {
         let finished_text = finished["params"]["update"]["content"][0]["content"]["text"]
             .as_str()
             .expect("finished text");
-        assert!(
-            finished_text.contains("Diff:"),
+        let parsed: serde_json::Value =
+            serde_json::from_str(finished_text).expect("finished_text should be json");
+        assert_eq!(
+            parsed["status"], "patched",
             "finished_text: {finished_text}"
         );
         assert!(
-            finished_text.contains("- old"),
+            parsed["path"].as_str().unwrap().contains("notes.txt"),
             "finished_text: {finished_text}"
         );
-        assert!(
-            finished_text.contains("+ new"),
+        assert_eq!(
+            parsed["occurrences_replaced"], 1,
             "finished_text: {finished_text}"
         );
     }

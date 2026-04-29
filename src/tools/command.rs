@@ -103,7 +103,14 @@ pub fn start_command_session(
     cmd: &str,
 ) -> Result<Value> {
     if is_blocked_command(cmd) {
-        bail!("Blocked potentially destructive command");
+        bail!(
+            "{}",
+            serde_json::json!({
+                "code": "command_blocked",
+                "message": "command was blocked as potentially destructive",
+                "next_step": "Rephrase the command to avoid destructive operations, or ask the user for confirmation."
+            })
+        );
     }
 
     let session = spawn_command_session(cwd, cmd)?;
@@ -132,7 +139,14 @@ pub fn run_command(
     cmd: &str,
 ) -> Result<String> {
     if is_blocked_command(cmd) {
-        bail!("Blocked potentially destructive command");
+        bail!(
+            "{}",
+            serde_json::json!({
+                "code": "command_blocked",
+                "message": "command was blocked as potentially destructive",
+                "next_step": "Rephrase the command to avoid destructive operations, or ask the user for confirmation."
+            })
+        );
     }
 
     let session = spawn_command_session(cwd, cmd)?;
@@ -162,6 +176,7 @@ pub fn run_command(
             sessions.lock().unwrap().remove(&session_id);
             return Ok(json!({
                 "cmd": cmd,
+                "cwd": session.cwd,
                 "running": false,
                 "exit_code": exit_code,
                 "output": output,
@@ -177,6 +192,7 @@ pub fn run_command(
             persist_snapshot(&session, true, None)?;
             return Ok(json!({
                 "cmd": cmd,
+                "cwd": session.cwd,
                 "session_id": session_id,
                 "running": true,
                 "exit_code": null,
@@ -201,8 +217,16 @@ pub fn read_command_session(
     };
 
     let Some(session) = session else {
-        let persisted = load_session_metadata(session_id)?
-            .ok_or_else(|| anyhow::anyhow!("Unknown command session"))?;
+        let persisted = load_session_metadata(session_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                serde_json::json!({
+                    "code": "unknown_session",
+                    "message": format!("no command session with id: {session_id}"),
+                    "next_step": "Use list_command_sessions_tool to see active sessions."
+                })
+            )
+        })?;
         return Ok(json!({
             "session_id": persisted.session_id,
             "cmd": persisted.cmd,
@@ -318,10 +342,16 @@ pub fn write_command_session(
 ) -> Result<Value> {
     let session = {
         let guard = sessions.lock().unwrap();
-        guard
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Unknown command session"))?
+        guard.get(session_id).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                serde_json::json!({
+                    "code": "unknown_session",
+                    "message": format!("no command session with id: {session_id}"),
+                    "next_step": "Use list_command_sessions_tool to see active sessions."
+                })
+            )
+        })?
     };
 
     // Check if still running
@@ -334,7 +364,14 @@ pub fn write_command_session(
         .flatten()
         .is_none();
     if !still_running {
-        bail!("Command session is not running");
+        bail!(
+            "{}",
+            serde_json::json!({
+                "code": "session_not_running",
+                "message": format!("command session {session_id} has already exited"),
+                "next_step": "Use list_command_sessions_tool to check session status."
+            })
+        );
     }
 
     session
@@ -363,8 +400,16 @@ pub fn terminate_command_session(
     };
 
     let Some(session) = session else {
-        let mut persisted = load_session_metadata(session_id)?
-            .ok_or_else(|| anyhow::anyhow!("Unknown command session"))?;
+        let mut persisted = load_session_metadata(session_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                serde_json::json!({
+                    "code": "unknown_session",
+                    "message": format!("no command session with id: {session_id}"),
+                    "next_step": "Use list_command_sessions_tool to see active sessions."
+                })
+            )
+        })?;
         persisted.running = false;
         persist_session_metadata(&persisted)?;
         return Ok(json!({
@@ -731,7 +776,12 @@ mod tests {
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let output = run_command(&sessions, tempdir.path(), "printf 'hi'").expect("run command");
         let parsed: Value = serde_json::from_str(&output).expect("json output");
+        let expected_cwd = tempdir.path().canonicalize().unwrap();
         assert_eq!(parsed["cmd"], "printf 'hi'");
+        assert_eq!(
+            parsed["cwd"].as_str().unwrap_or_default(),
+            expected_cwd.to_string_lossy()
+        );
         assert_eq!(parsed["running"], false);
         assert_eq!(parsed["exit_code"], 0);
         assert_eq!(parsed["output"], "hi");
@@ -750,16 +800,28 @@ mod tests {
                 .expect("run command");
 
             let parsed: Value = serde_json::from_str(&output).expect("json output");
-            assert!(parsed["session_id"].as_str().unwrap().starts_with("cmdsess_"));
+            assert!(
+                parsed["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("cmdsess_")
+            );
             assert_eq!(parsed["running"], true);
 
             let listed = list_command_sessions(&sessions).expect("list");
             let items = listed.as_array().expect("array");
             assert!(!items.is_empty());
-            assert!(items.iter().any(|item| item["running"] == Value::Bool(true)));
-            assert!(items
-                .iter()
-                .any(|item| item["last_output"].as_str().unwrap_or_default().contains("ready")));
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item["running"] == Value::Bool(true))
+            );
+            assert!(items.iter().any(|item| {
+                item["last_output"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("ready")
+            }));
             unsafe {
                 std::env::remove_var("MLX_ACP_RUN_COMMAND_TIMEOUT_MS");
             }
@@ -787,7 +849,12 @@ mod tests {
                 .collect();
             assert_eq!(matching.len(), 1);
             assert_eq!(matching[0]["running"], Value::Bool(false));
-            assert!(matching[0]["last_output"].as_str().unwrap().contains("ready"));
+            assert!(
+                matching[0]["last_output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ready")
+            );
         });
     }
 

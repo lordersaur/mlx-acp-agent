@@ -264,27 +264,28 @@ impl MlxClient {
         let mut tool_calls_final: Vec<ChatToolCall> = Vec::new();
         let mut content_stream = ContentStreamState::default();
         let mut answer_stream = AnswerStreamState::default();
+        let mut pending_sse_line = String::new();
 
         while let Some(item) = byte_stream.next().await {
             let bytes = item.context("error reading SSE stream")?;
             let text = String::from_utf8_lossy(&bytes);
 
-            for line in text.lines() {
+            consume_sse_chunk(&mut pending_sse_line, &text, |line| {
                 let line = line.trim();
                 if !line.starts_with("data: ") {
-                    continue;
+                    return;
                 }
                 let payload = &line["data: ".len()..];
                 if payload == "[DONE]" {
-                    continue;
+                    return;
                 }
                 let data: Value = match serde_json::from_str(payload) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => return,
                 };
                 let choices = match data["choices"].as_array() {
                     Some(c) => c,
-                    None => continue,
+                    None => return,
                 };
                 for choice in choices {
                     let delta = &choice["delta"];
@@ -313,6 +314,57 @@ impl MlxClient {
                         for tc in tcs {
                             if let Ok(call) = serde_json::from_value::<ChatToolCall>(tc.clone()) {
                                 tool_calls_final.push(call);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if !pending_sse_line.trim().is_empty() {
+            let line = pending_sse_line.trim();
+            if line.starts_with("data: ") {
+                let payload = &line["data: ".len()..];
+                if payload != "[DONE]" {
+                    let data: Value = match serde_json::from_str(payload) {
+                        Ok(v) => v,
+                        Err(_) => Value::Null,
+                    };
+                    if let Some(choices) = data["choices"].as_array() {
+                        for choice in choices {
+                            let delta = &choice["delta"];
+
+                            if let Some(content) = delta["content"].as_str() {
+                                if !content.is_empty() {
+                                    full_text.push_str(content);
+                                    for event in stream_content_chunk(&mut content_stream, content)
+                                    {
+                                        match event {
+                                            StreamEvent::Thought(chunk) => {
+                                                think_tx.send(chunk).ok();
+                                            }
+                                            StreamEvent::Answer(chunk) => {
+                                                if let Some(ref tx) = answer_tx {
+                                                    stream_answer_chunk(
+                                                        &mut answer_stream,
+                                                        &chunk,
+                                                        tx,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(tcs) = delta["tool_calls"].as_array() {
+                                for tc in tcs {
+                                    if let Ok(call) =
+                                        serde_json::from_value::<ChatToolCall>(tc.clone())
+                                    {
+                                        tool_calls_final.push(call);
+                                    }
+                                }
                             }
                         }
                     }
@@ -383,6 +435,10 @@ impl Default for ThinkState {
 struct ContentStreamState {
     thought: ThinkState,
     buf: String,
+    /// True while streaming a secondary thought block (re-opened after the
+    /// first close tag). Content is discarded so it does not appear in Zed
+    /// as a duplicate thought panel.
+    secondary: bool,
 }
 
 #[derive(Default)]
@@ -435,7 +491,7 @@ fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<St
                     }
                 } else if let Some((oi, open_tag)) = earliest_open {
                     let prefix = state.buf[..oi].to_owned();
-                    if !prefix.is_empty() {
+                    if !prefix.trim().is_empty() {
                         events.push(StreamEvent::Answer(prefix));
                     }
                     state.buf = state.buf[oi + open_tag.len()..].to_owned();
@@ -443,7 +499,13 @@ fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<St
                     state.thought = ThinkState::Inside;
                     // loop: check if close tag is already in buf
                 } else {
-                    // Preserve a small suffix in case a Gemma tag is split across chunks.
+                    // Buffer until we are reasonably sure it's not an initial tag.
+                    // This avoids leaking the first few words of a thought that arrives
+                    // before its tag (or a pre-filled thought).
+                    let wait_limit = 100;
+                    if state.buf.len() < wait_limit {
+                        break;
+                    }
                     let safe = state.buf.len().saturating_sub(MAX_TAG_LEN - 1);
                     let safe = floor_char_boundary(&state.buf, safe);
                     if safe > 0 {
@@ -457,11 +519,13 @@ fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<St
                 let close = earliest_tag(&state.buf, &[CLOSE_GEMMA_THINK, CLOSE_CHANNEL]);
                 if let Some((idx, tag)) = close {
                     let before_close = state.buf[..idx].to_owned();
-                    if !before_close.is_empty() {
+                    // Only emit thought content for the primary (first) block.
+                    if !before_close.is_empty() && !state.secondary {
                         events.push(StreamEvent::Thought(before_close));
                     }
                     let answer = state.buf[idx + tag.len()..].to_owned();
                     state.buf.clear();
+                    state.secondary = false;
                     state.thought = ThinkState::After;
                     if !answer.is_empty() {
                         events.push(StreamEvent::Answer(answer));
@@ -471,7 +535,10 @@ fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<St
                     let safe = state.buf.len().saturating_sub(12);
                     let safe = floor_char_boundary(&state.buf, safe);
                     if safe > 0 {
-                        events.push(StreamEvent::Thought(state.buf[..safe].to_owned()));
+                        // Only emit thought content for the primary (first) block.
+                        if !state.secondary {
+                            events.push(StreamEvent::Thought(state.buf[..safe].to_owned()));
+                        }
                         state.buf.drain(..safe);
                     }
                     break;
@@ -487,23 +554,24 @@ fn stream_content_chunk(state: &mut ContentStreamState, content: &str) -> Vec<St
                     if let Some((ci, close_tag)) =
                         earliest_tag(&inner, &[CLOSE_GEMMA_THINK, CLOSE_CHANNEL])
                     {
-                        // Balanced block: emit prefix as answer, body as thought, skip markers.
+                        // Balanced secondary block: emit prefix as answer, discard body
+                        // (do NOT send to think_tx — prevents a duplicate thought panel in Zed).
                         if oi > 0 {
                             events.push(StreamEvent::Answer(state.buf[..oi].to_owned()));
-                        }
-                        let body = inner[..ci].trim().to_owned();
-                        if !body.is_empty() {
-                            events.push(StreamEvent::Thought(body));
                         }
                         state.buf = inner[ci + close_tag.len()..].to_owned();
                         // loop: remain in After, handle whatever follows
                     } else {
-                        // Open tag but no close yet — emit what's safe before the open.
+                        // Open tag but no close yet — emit prefix as answer, then
+                        // transition to Inside marked as secondary so its content is discarded.
                         if oi > 0 {
                             events.push(StreamEvent::Answer(state.buf[..oi].to_owned()));
-                            state.buf.drain(..oi);
                         }
-                        break;
+                        state.buf = state.buf[oi + open_tag.len()..].to_owned();
+                        strip_leading_channel_separator(&mut state.buf);
+                        state.secondary = true;
+                        state.thought = ThinkState::Inside;
+                        // loop: will handle Inside state in next iteration
                     }
                 } else {
                     // No open tags — safe-emit the remainder as answer.
@@ -553,6 +621,21 @@ fn stream_answer_chunk(
     let text = clean_streaming_chunk(content);
     if !text.is_empty() {
         tx.send(text).ok();
+    }
+}
+
+fn consume_sse_chunk<F>(pending: &mut String, chunk: &str, mut on_line: F)
+where
+    F: FnMut(&str),
+{
+    if !chunk.is_empty() {
+        pending.push_str(chunk);
+    }
+
+    while let Some(newline) = pending.find('\n') {
+        let line: String = pending.drain(..=newline).collect();
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
+        on_line(line);
     }
 }
 
@@ -690,7 +773,7 @@ fn value_to_string(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnswerStreamState, ContentStreamState, StreamEvent, clean_model_text,
+        AnswerStreamState, ContentStreamState, StreamEvent, clean_model_text, consume_sse_chunk,
         finish_content_stream, stream_answer_chunk, stream_content_chunk,
     };
     use tokio::sync::mpsc;
@@ -815,6 +898,40 @@ mod tests {
     }
 
     #[test]
+    fn stream_content_chunk_discards_secondary_thought_mid_answer() {
+        let mut state = ContentStreamState::default();
+        let mut thought = String::new();
+        let mut answer = String::new();
+
+        // Primary thought followed by partial answer.
+        for event in stream_content_chunk(&mut state, "<|think|>first<|/think|>Keep re") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+
+        // Secondary thought opens mid-word — body must be discarded, not sent to Zed.
+        for event in stream_content_chunk(&mut state, "<|think|>second<|/think|>asoning") {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+
+        for event in finish_content_stream(&mut state) {
+            match event {
+                StreamEvent::Thought(chunk) => thought.push_str(&chunk),
+                StreamEvent::Answer(chunk) => answer.push_str(&chunk),
+            }
+        }
+
+        // Only the primary thought is emitted; secondary is silently discarded.
+        assert_eq!(thought, "first");
+        assert_eq!(answer, "Keep reasoning");
+    }
+
+    #[test]
     fn stream_answer_chunk_sends_immediately() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = AnswerStreamState::default();
@@ -848,6 +965,23 @@ mod tests {
         stream_answer_chunk(&mut state, &"a".repeat(600), &tx);
         // Sent immediately — no need to flush.
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn consume_sse_chunk_buffers_split_lines() {
+        let mut pending = String::new();
+        let mut lines = Vec::new();
+
+        consume_sse_chunk(&mut pending, "data: one", |line| {
+            lines.push(line.to_owned());
+        });
+        assert!(lines.is_empty());
+
+        consume_sse_chunk(&mut pending, "\ndata: two\n", |line| {
+            lines.push(line.to_owned());
+        });
+
+        assert_eq!(lines, vec!["data: one", "data: two"]);
     }
 
     #[test]

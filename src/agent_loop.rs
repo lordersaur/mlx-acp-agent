@@ -12,22 +12,24 @@ use crate::model_parser::extract_thought_blocks;
 
 pub const SYSTEM_PROMPT: &str = "\
 You are a coding agent called Gemma 4.
-Use tools for source-backed claims.
-Keep reasoning private.
-Think efficiently and briefly.
-Plan complex tasks internally before acting or answering.
-Honor explicit constraints, delimiters, and examples.
-For broad audits, use `list_dir_tool` with metadata to discover files, then `read_file_tool` for the relevant content. Continue truncated file reads until complete, and answer only after you have enough coverage. When you need full-file coverage, prefer parallel tool calls for independent files and use larger read limits instead of many tiny reads.
-Treat returned source content as the material to analyze immediately; do not wait for more unless the tool explicitly says it is incomplete.
-When coverage is complete, stop gathering and write the requested analysis or refactor plan immediately.
-Do not restate the audit plan after coverage is complete.
-When files are independent, read in parallel.
-When the user names a specific file, read it directly with `read_file_tool` — do not list or search first.
-For file or module understanding without a named file, use `list_dir_tool` to locate it, then read.
-For narrow symbol lookups, go straight to `search_code_tool` — no directory listing needed first. Then read the relevant lines.
-Use line counts only to size reads.
-Before changing a public function's signature, return type, or name, use `search_code_tool` to find all call sites first and update them in the same change.
-If unsure, say so.
+Think briefly in action-focused bullets before acting. Do not restate the user's request.
+Honor the user's intent boundary. If asked to research, compare, recommend, or choose an approach, answer with the recommendation and ask before creating files, installing dependencies, or scaffolding. Build only after the user explicitly asks to proceed or has already chosen the stack.
+Ask a concise clarification only when ambiguity blocks safe progress. Otherwise make reasonable assumptions and continue.
+If the user says to continue, proceed, do it, ok, or stop asking for confirmation, keep working until blocked by missing information, unavailable tools, or validation failure.
+Use tools for real inspection and changes. Never claim a file, command, or test changed unless a tool result shows it.
+Before installing a missing runtime or package manager dependency, inspect the environment first: OS, available package managers, and whether the command needs interactive credentials. Do not try sudo unless the user explicitly requested sudo.
+When a runtime, command, dependency, or stack is unavailable, stop that stack plan and ask whether to install the missing capability or switch paths. Do not invent files around a failed scaffold.
+Use run_command_tool for finite commands, even if slow: build, test, install, format, scaffold. Use start_command_session_tool only for commands meant to stay alive, interactive commands, watchers, or later polling: dev servers, `dotnet run`, `npm run dev`.
+For project commands, pass `cwd` instead of relying on a previous `cd`. Each command starts fresh.
+File tools (read_file_tool, create_artifact_tool, edit_file_tool, patch_file_tool, list_dir_tool) always resolve paths from the workspace root. The `cwd` on a command tool is scoped to that single command and does not shift the base for file tools. Never assume you are inside a subdirectory — always use full workspace-relative paths (e.g. `MyApp/src/Page.tsx`, not `src/Page.tsx`).
+Use parallel tool calls only for independent non-command work such as reads, searches, or creating unrelated files. Do not run package installs, builds, tests, dev servers, or other side-effecting commands in parallel.
+For named files, read them directly. For named symbols, search first for the line, then read the relevant file section. Search snippets are candidates, not enough context by themselves.
+After scaffolding, inspect the actual generated directories before assuming framework paths. If an expected path is missing, list nearby directories and follow the discovered structure.
+Before any command that moves, copies, or restructures paths (mv, cp -r, rsync, rename, etc.), check whether the destination already exists using list_dir_tool. If the destination is an existing directory, shell commands like mv and cp will place the source inside it rather than replacing it — often producing unwanted nesting. Verify the target state first, then move contents explicitly if needed.
+Before changing a public function signature or name, find call sites and update them in the same task.
+Write or edit files with tools; do not draft file contents in assistant text. Never use create_artifact_tool for directories.
+When a planned action requires a tool call, issue the tool call immediately — do not narrate it with phrases like 'I will...', 'First, I will...', or 'Action:' and then stop. A description without a following tool call is a failure.
+Trust structured tool result fields first, especially `status`, `error`, `diagnostics`, `exit_code`, `running`, and `cwd`.
 ";
 // ---------------------------------------------------------------------------
 // Public types
@@ -128,7 +130,6 @@ impl CoverageTracker {
                 .iter()
                 .all(|path| self.covered_files.contains(path))
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -144,9 +145,9 @@ pub struct AgentLoopOptions {
 impl Default for AgentLoopOptions {
     fn default() -> Self {
         Self {
-            max_iterations: 16,
-            max_tokens: 3200,
-            temperature: 1.0,
+            max_iterations: 32,
+            max_tokens: 12000,
+            temperature: 0.3,
             // Gemma 4 emits at most 3 tool calls per turn (enforced by Python server).
             // Keep Rust in sync so the truncation logic here is never a surprise.
             max_parallel_tool_calls: 3,
@@ -257,7 +258,7 @@ pub async fn run_agent_loop(
     debug_assert!(conversation.iter().skip(1).all(|m| m.role != "system"));
 
     for iteration in 0..options.max_iterations {
-        let mut iteration_reasoning = String::new();
+        let mut thoughts_streamed = false;
 
         // When a thought handler is present, enable streaming so think tokens
         // arrive in real time (writing animation in the Zed panel).
@@ -282,7 +283,7 @@ pub async fn run_agent_loop(
                     res = &mut complete_fut => break res?,
                     Some(chunk) = think_rx.recv() => {
                         if !chunk.is_empty() {
-                            append_reasoning_chunk(&mut iteration_reasoning, &chunk);
+                            thoughts_streamed = true;
                         }
                         if let Some(ref mut handler) = on_thought {
                             handler.on_thought_chunk(&chunk).await;
@@ -303,6 +304,9 @@ pub async fn run_agent_loop(
 
         // Drain any chunks that arrived just before complete() returned.
         while let Ok(chunk) = think_rx.try_recv() {
+            if !chunk.is_empty() {
+                thoughts_streamed = true;
+            }
             if let Some(ref mut handler) = on_thought {
                 handler.on_thought_chunk(&chunk).await;
             }
@@ -333,16 +337,12 @@ pub async fn run_agent_loop(
         };
 
         // Only emit thoughts for the non-streaming path (streaming already sent them).
-        if on_thought.is_some() && !thoughts.is_empty() {
+        if !thoughts_streamed && on_thought.is_some() && !thoughts.is_empty() {
             if let Some(handler) = on_thought.as_deref_mut() {
                 for thought in &thoughts {
                     handler.on_thought(thought).await;
                 }
             }
-        }
-
-        if !thoughts.is_empty() {
-            append_reasoning_chunk(&mut iteration_reasoning, &thoughts.join("\n\n"));
         }
 
         if result.tool_calls.is_empty() {
@@ -362,7 +362,6 @@ pub async fn run_agent_loop(
         if let Some(handler) = on_thought.as_deref_mut() {
             if let Some(ref text) = clean_text {
                 if !text.trim().is_empty() {
-                    append_reasoning_chunk(&mut iteration_reasoning, text);
                     handler.on_thought(text).await;
                 }
             }
@@ -419,15 +418,11 @@ pub async fn run_agent_loop(
             conversation.push(ChatMessage::tool_result(&exec.id, result));
         }
 
-        if let Some(summary) =
-            summarize_reasoning_for_context(&iteration_reasoning, coverage.is_complete())
-        {
-            conversation.push(ChatMessage::assistant(summary));
-        }
+        let _ = coverage.is_complete();
     }
 
     Ok(LoopResult {
-        answer: "Reached maximum iterations.".to_owned(),
+        answer: build_interruption_summary(&all_tool_results),
         tool_results: all_tool_results,
         iterations: options.max_iterations,
         answer_streamed,
@@ -488,7 +483,9 @@ async fn execute_one(
         && repeated_successful_call_count(tool_call, previous_results) >= 1
     {
         let replay = previous_results.iter().rev().find(|result| {
-            !result.error && result.name == tool_call.name && result.arguments == tool_call.arguments
+            !result.error
+                && result.name == tool_call.name
+                && result.arguments == tool_call.arguments
         });
         return ToolExecution {
             id: tool_call.id.clone(),
@@ -521,89 +518,6 @@ async fn execute_one(
             result: error.to_string(),
             error: true,
         },
-    }
-}
-
-fn append_reasoning_chunk(buf: &mut String, chunk: &str) {
-    let normalized = chunk
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.is_empty() {
-        return;
-    }
-    if !buf.is_empty() {
-        buf.push('\n');
-    }
-    buf.push_str(&normalized);
-}
-
-fn summarize_reasoning_for_context(reasoning: &str, coverage_complete: bool) -> Option<String> {
-    let compact = reasoning
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_owned();
-    if compact.is_empty() {
-        return None;
-    }
-
-    let mut summary = to_past_tense_summary(&compact);
-    if coverage_complete {
-        summary.push_str(" Coverage had been completed.");
-    }
-
-    const MAX_SUMMARY_CHARS: usize = 360;
-    if summary.len() <= MAX_SUMMARY_CHARS {
-        return Some(summary);
-    }
-
-    let mut end = MAX_SUMMARY_CHARS;
-    while end > 0 && !summary.is_char_boundary(end) {
-        end -= 1;
-    }
-    Some(format!("{} ...", &summary[..end]))
-}
-
-fn to_past_tense_summary(text: &str) -> String {
-    let trimmed = text.trim().trim_end_matches('.');
-    let lower_first = |value: &str| {
-        let mut chars = value.chars();
-        match chars.next() {
-            Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
-            None => String::new(),
-        }
-    };
-
-    let past = if let Some(rest) = trimmed.strip_prefix("I should ") {
-        format!("I had decided to {}", lower_first(rest))
-    } else if let Some(rest) = trimmed.strip_prefix("I will ") {
-        format!("I had planned to {}", lower_first(rest))
-    } else if let Some(rest) = trimmed.strip_prefix("I need to ") {
-        format!("I had needed to {}", lower_first(rest))
-    } else if let Some(rest) = trimmed.strip_prefix("I want to ") {
-        format!("I had wanted to {}", lower_first(rest))
-    } else if let Some(rest) = trimmed.strip_prefix("I must ") {
-        format!("I had to {}", lower_first(rest))
-    } else if let Some(rest) = trimmed.strip_prefix("Let's ") {
-        format!("I had decided to {}", lower_first(rest))
-    } else if let Some(rest) = trimmed.strip_prefix("We should ") {
-        format!("I had decided that we should {}", lower_first(rest))
-    } else if let Some(rest) = trimmed.strip_prefix("I am ") {
-        format!("I had been {}", lower_first(rest))
-    } else if let Some(rest) = trimmed.strip_prefix("I was ") {
-        format!("I had been {}", lower_first(rest))
-    } else {
-        format!("I had already {}", lower_first(trimmed))
-    };
-
-    if past.ends_with('.') {
-        past
-    } else {
-        format!("{past}.")
     }
 }
 
@@ -645,7 +559,9 @@ fn repeated_successful_call_count(
     previous_results
         .iter()
         .filter(|result| {
-            !result.error && result.name == tool_call.name && result.arguments == tool_call.arguments
+            !result.error
+                && result.name == tool_call.name
+                && result.arguments == tool_call.arguments
         })
         .count()
 }
@@ -659,6 +575,57 @@ fn is_context_gathering_tool(name: &str) -> bool {
             | "find_file_tool"
             | "web_fetch_tool"
             | "web_search_tool"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Interruption summary
+// ---------------------------------------------------------------------------
+
+/// Builds a compact resume note when the loop hits max_iterations.
+/// Derived purely from tool_results — no extra model call needed.
+/// Stored as the final assistant turn so the next "continue" session has context.
+fn build_interruption_summary(tool_results: &[ToolExecution]) -> String {
+    let write_tools = ["create_artifact_tool", "edit_file_tool", "patch_file_tool"];
+    let mut files_written: Vec<&str> = tool_results
+        .iter()
+        .filter(|t| write_tools.contains(&t.name.as_str()))
+        .filter_map(|t| {
+            t.arguments
+                .get("path")
+                .or_else(|| t.arguments.get("filename"))
+                .and_then(Value::as_str)
+        })
+        .collect();
+    files_written.dedup();
+
+    let last_tool = tool_results
+        .last()
+        .map(|t| t.name.as_str())
+        .unwrap_or("none");
+
+    let files_section = if files_written.is_empty() {
+        "  (none)".to_owned()
+    } else {
+        files_written
+            .iter()
+            .map(|f| format!("  - {f}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "Interrupted: reached the iteration limit mid-task.\n\
+        \n\
+        Files written this session:\n\
+        {files_section}\n\
+        \n\
+        Last action: {last_tool}\n\
+        \n\
+        Context for the next message:\n\
+        - If asked to continue: start with list_dir_tool on the workspace root to confirm what exists, then resume from where it stopped without recreating existing files.\n\
+        - If asked to correct or adjust something: apply the correction and continue.\n\
+        - If asked to start over or do something new: ignore this summary and proceed with the new request."
     )
 }
 
@@ -975,59 +942,8 @@ mod tests {
 
         assert_eq!(result.answer, "I have enough context.");
         assert_eq!(result.tool_results.len(), 2);
-        assert_eq!(
-            result.tool_results[1].result,
-            "acp.rs\nagent_loop.rs"
-        );
+        assert_eq!(result.tool_results[1].result, "acp.rs\nagent_loop.rs");
         assert_eq!(tools.calls.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn injects_compact_reasoning_summary_before_next_iteration() {
-        let model = MockModel::new(vec![
-            CompletionResult {
-                content: Some(
-                    "<|channel>thought\nI should inspect the tree before planning.<channel|>"
-                        .to_owned(),
-                ),
-                tool_calls: vec![ApiToolCall {
-                    id: "call_1".to_owned(),
-                    name: "list_dir_tool".to_owned(),
-                    arguments: json!({"path": "src"}).as_object().cloned().unwrap(),
-                }],
-            },
-            text_response("Done."),
-        ]);
-        let tools = MockTools::with_outputs(HashMap::from([(
-            "list_dir_tool".to_owned(),
-            Ok("acp.rs\nagent_loop.rs".to_owned()),
-        )]));
-
-        run_agent_loop(
-            &model,
-            &[ConversationMessage::new("user", "Inspect src.")],
-            &tools,
-            &[],
-            None,
-            AgentLoopOptions::default(),
-        )
-        .await
-        .expect("loop should succeed");
-
-        let requests = model.requests.lock().await;
-        assert_eq!(requests.len(), 2);
-        let second = &requests[1];
-        let summary_msg = second
-            .iter()
-            .find(|msg| msg.role == "assistant" && msg.content.as_deref().unwrap_or_default().contains("I had decided"))
-            .expect("reasoning summary");
-        assert!(
-            summary_msg
-                .content
-                .as_deref()
-                .unwrap_or_default()
-                .contains("I had decided to inspect the tree before planning.")
-        );
     }
 
     #[tokio::test]
@@ -1080,6 +996,35 @@ mod tests {
         // The tool result message should have tool_call_id == "abc123".
         let tool_msg = second.iter().find(|m| m.role == "tool").expect("tool msg");
         assert_eq!(tool_msg.tool_call_id.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn does_not_inject_reasoning_summary_before_next_iteration() {
+        let model = MockModel::new(vec![
+            tool_call_response("call_1", "list_dir_tool", json!({"path": "src"})),
+            text_response("Done."),
+        ]);
+        let tools = MockTools::with_outputs(HashMap::from([(
+            "list_dir_tool".to_owned(),
+            Ok("acp.rs\nagent_loop.rs".to_owned()),
+        )]));
+
+        run_agent_loop(
+            &model,
+            &[ConversationMessage::new("user", "Inspect src.")],
+            &tools,
+            &[],
+            None,
+            AgentLoopOptions::default(),
+        )
+        .await
+        .expect("loop should succeed");
+
+        let requests = model.requests.lock().await;
+        let second = &requests[1];
+        assert!(!second.iter().any(|msg| {
+            msg.role == "assistant" && msg.content.as_deref().unwrap_or_default().contains("I had")
+        }));
     }
 
     #[tokio::test]
@@ -1303,21 +1248,28 @@ Run `cargo test`.<tool_call|>"#,
 
     #[test]
     fn system_prompt_has_key_rules() {
-        assert!(SYSTEM_PROMPT.contains("You are a coding agent"));
-        assert!(SYSTEM_PROMPT.contains("Use tools for source-backed claims"));
-        assert!(SYSTEM_PROMPT.contains("Keep reasoning private"));
-        assert!(SYSTEM_PROMPT.contains("Think efficiently and briefly"));
-        assert!(SYSTEM_PROMPT.contains("Plan complex tasks internally"));
-        assert!(SYSTEM_PROMPT.contains("constraints, delimiters, and examples"));
-        assert!(SYSTEM_PROMPT.contains("For broad audits"));
-        assert!(SYSTEM_PROMPT.contains("`list_dir_tool` with metadata to discover files"));
-        assert!(SYSTEM_PROMPT.contains("Continue truncated file reads until complete"));
-        assert!(SYSTEM_PROMPT.contains("When coverage is complete"));
-        assert!(SYSTEM_PROMPT.contains("Do not restate the audit plan after coverage is complete"));
-        assert!(SYSTEM_PROMPT.contains("When files are independent, read in parallel"));
-        assert!(SYSTEM_PROMPT.contains("For file or module understanding"));
-        assert!(SYSTEM_PROMPT.contains("go straight to `search_code_tool`"));
-        assert!(SYSTEM_PROMPT.contains("Use line counts only to size reads"));
-        assert!(SYSTEM_PROMPT.contains("find all call sites first and update them in the same change"));
+        assert!(SYSTEM_PROMPT.contains("You are a coding agent called Gemma 4"));
+        assert!(SYSTEM_PROMPT.contains("Do not restate the user's request"));
+        assert!(SYSTEM_PROMPT.contains("Honor the user's intent boundary"));
+        assert!(
+            SYSTEM_PROMPT
+                .contains("ask before creating files, installing dependencies, or scaffolding")
+        );
+        assert!(SYSTEM_PROMPT.contains("stop asking for confirmation"));
+        assert!(SYSTEM_PROMPT.contains("inspect the environment first"));
+        assert!(
+            SYSTEM_PROMPT.contains("Do not try sudo unless the user explicitly requested sudo")
+        );
+        assert!(SYSTEM_PROMPT.contains("runtime, command, dependency, or stack is unavailable"));
+        assert!(SYSTEM_PROMPT.contains("Use run_command_tool for finite commands"));
+        assert!(
+            SYSTEM_PROMPT
+                .contains("Use start_command_session_tool only for commands meant to stay alive")
+        );
+        assert!(SYSTEM_PROMPT.contains("pass `cwd`"));
+        assert!(SYSTEM_PROMPT.contains("Do not run package installs, builds, tests, dev servers"));
+        assert!(SYSTEM_PROMPT.contains("Search snippets are candidates"));
+        assert!(SYSTEM_PROMPT.contains("inspect the actual generated directories"));
+        assert!(SYSTEM_PROMPT.contains("Never use create_artifact_tool for directories"));
     }
 }
